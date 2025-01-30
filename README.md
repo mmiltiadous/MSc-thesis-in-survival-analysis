@@ -11,4 +11,5 @@ This folder contains the R markdown file used for Simulation Study 2. In the wor
 In this folder, the R markdown file which was used for the comparisons of ADMM-based survRRR, glmnet-based survRRR, and unpenalized survRRR algorithms is presented. The ADMM algorithm is presented in a chick of the markdown file while the glmnet-based algorithm is in pen_survRRR.R file and was taken from the study of Sluiskes et al. (2024). 
 
 # References:
-1. Sluiskes, M. H., Putter, H., Beekman, M., Goeman, J. J., & Rodríguez-Girondo, M. (2024). Penalized reduced rank regression for multi-outcome survival data supports a common metabolic risk score for age-related diseases. bioRxiv. https://doi.org/10.1101/2024.11.11.622920.
+1. Fiocco, M., Putter, H., & van Houwelingen, J. C. (2005). Reduced rank proportional hazards model for competing risks. *Biostatistics, 6*(3), 465–478. https://doi.org/10.1093/biostatistics/kxi022
+2. Sluiskes, M. H., Putter, H., Beekman, M., Goeman, J. J., & Rodríguez-Girondo, M. (2024). Penalized reduced rank regression for multi-outcome survival data supports a common metabolic risk score for age-related diseases. bioRxiv. https://doi.org/10.1101/2024.11.11.622920.
