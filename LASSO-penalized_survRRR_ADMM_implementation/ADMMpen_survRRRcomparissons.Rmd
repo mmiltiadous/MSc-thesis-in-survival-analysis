@@ -1,0 +1,4242 @@
+---
+title: "Untitled"
+output: html_document
+date: "2024-08-01"
+---
+
+# Libraries
+
+```{r}
+# Source penalized survRRR functions Marije
+source('pen_survrrr.R') #glmnet-based implementation
+
+# Start here
+library(tidyverse)
+library(survival)
+library(lubridate)
+library(mstate)
+library(glmnet)
+library(numDeriv)
+library(MASS)
+library(mstate)
+library(survival)
+library(ggplot2)
+library(gridExtra)
+library(reshape2)
+library(reshape)
+library(data.table)
+library(scales)
+library(doParallel)
+library(foreach)
+library(parallel)
+library(data.table)
+library(mvtnorm)
+library(dplyr)
+library(pracma)
+library(gplots)
+library(latex2exp)
+library(patchwork)
+
+Print_flug = FALSE
+```
+
+
+# Function to generate covariate matrix, A,$\Gamma$ and B
+
+```{r}
+add_zeros <- function(matrix, percentage = 0.10) {
+  total_components <- length(matrix)
+  zeros_count <- floor(total_components * percentage)
+  
+  indexes <- 1:total_components
+  
+  zero_indexes <- sample(indexes, zeros_count)
+  
+  matrix[zero_indexes] <- 0
+  
+  return(matrix)
+}
+```
+
+```{r}
+simulate_Beta_matrix = function(p,r,k,case=1){
+if (case == 1){
+    #GENERATE A, \Gamma and B matrix
+    #A matrix
+    A_matrix <- matrix(NA, nrow = p, ncol = r)
+    for (i in 1:r) {
+      A_matrix [, i] <- runif(p, 0,1)
+    }
+    #Gamma matrix
+    Gamma_matrix <- matrix(NA, nrow = k, ncol = r)
+    for (i in 1:r) {
+      Gamma_matrix [, i] <- runif(k, 0,1)
+    }
+
+}
+  else if(case ==2){
+    if (p %% 2 != 0) {
+      stop("p must be an even number")
+    }
+    #GENERATE A, \Gamma and B matrix
+    #A matrix (1|0;0|1)
+    A_matrix <- matrix(NA, nrow = p, ncol = r)
+    for (i in 1:r/2) {
+      A_matrix [, i] <- c(runif(p/2, 0,1),rep(0,p/2))
+    }
+    for (i in (r/2+1):r) {
+      A_matrix [, i] <- c(rep(0,p/2),runif(p/2, 0,1))
+    }
+    #Gamma matrix (1|0;0|1)
+    Gamma_matrix <- matrix(NA, nrow = k, ncol = r)
+    for (i in 1:r/2) {
+      Gamma_matrix [, i] <- c(runif(k/2, 0,1),rep(0,k/2))
+    }
+    for (i in (r/2+1):r) {
+      Gamma_matrix [, i] <- c(rep(0,k/2),runif(k/2, 0,1))
+    }
+  }
+  
+      else if(case ==3){
+    #GENERATE A, \Gamma and B matrix
+    #A matrix
+    A_matrix <- matrix(NA, nrow = p, ncol = r)
+    for (i in 1:r) {
+      A_matrix [, i] <- runif(p, 0,1)
+    }
+    #Gamma matrix
+    Gamma_matrix <- matrix(NA, nrow = k, ncol = r)
+    for (i in 1:r) {
+      Gamma_matrix [, i] <- runif(k, 0,1)
+    }
+    A_matrix <- add_zeros(A_matrix, percent = 0.10)
+    Gamma_matrix <- add_zeros(Gamma_matrix, percent = 0.10)
+    
+      }
+  
+  #Coefficient matrix B (p x k)
+  Beta_matrix = A_matrix %*% t(Gamma_matrix)
+
+return(list(B_matrix=Beta_matrix/100,
+            A_matrix=A_matrix,
+            G_matrix=Gamma_matrix))
+}
+```
+
+# Function to simulate dataset
+
+```{r}
+
+simulate_data_redrank_model = function(Beta_matrix,n,corr=0){
+
+p=nrow(Beta_matrix)
+k=ncol(Beta_matrix)
+
+#GENERATE covariate matrix X
+if (corr ==0){
+X <- matrix(NA, nrow = n, ncol = p)
+#n random variables p times and place them in the matrix columns, to be uncorrelated
+for (i in 1:p) {
+  X[, i] <- rnorm(n, mean = 0, sd = 1)
+}
+} else if(corr>0){
+
+  mean_vector <- rep(0, p)  # Mean vector
+  correlation <- corr      # Desired correlation
+
+  #covariance matrix with correlation 0.8
+  covariance_matrix <- matrix(correlation, nrow = p, ncol = p)
+  diag(covariance_matrix) <- 1  
+
+  # Generate the matrix using rmvnorm
+  X <- rmvnorm(n, mean = mean_vector, sigma = covariance_matrix)
+  
+  if (Print_flug == TRUE){
+  print(X)
+    print(cor(X))
+    }
+}
+
+#GENERATE T(times)
+# later: mean_age = 60 
+# Linear predictors
+eta <- X %*% Beta_matrix
+exp_eta=exp(eta)
+exp_eta[exp_eta <= 1e-300] <- 1e-300 
+
+# Outcome times T from exp distribution
+T <- matrix(NA, nrow = n, ncol = k)
+for (i in 1:k) {
+   T[, i] <- rexp(n, rate =  exp_eta[,i])
+}
+
+#GENERATE censoring 
+#Random censoring time from Uniform distribution
+C <- runif(n, min = 0, max = 1)
+
+#DETERMINE the observed time and censoring indicator
+T_obs <- pmin(T, C)
+delta <- as.integer(T <= C)  # 1 if the event occurred, 0 if censored
+# Check the proportion of censored vs event occurrences
+prop_censored <- sum(delta == 0)/n/k
+prop_event <- sum(delta == 1)/n/k
+# Output proportions 
+
+if (Print_flug == TRUE){
+print(paste('Proportion of no events',prop_censored))
+print(paste('Proportion of events',prop_event))
+}
+
+#CREATE matrix with data for each outcome
+observed_times = T_obs
+event = matrix(delta,n,k)
+
+
+#CREATE data frame
+data <- data.frame(id = 1:n)
+for (i in 1:k) {
+  data[[paste0("t", i)]] <- observed_times[, i]
+  data[[paste0("d", i)]] <- event[, i]
+}
+# Add predictors 
+for (i in 1:p) {
+  data[[paste0("x", i)]] <- X[, i]
+}
+
+return (list(
+    data = data,
+    X=X,
+    T_sim=T,
+    T_obs=T_obs
+  ))
+}
+```
+
+# Function to preprocess data to be ready to enter the redrank model
+
+```{r}
+
+preprocess_data_redrank_model = function(data,k){
+
+#subjects
+n <- nrow(data)
+
+# Transition matrix(k outcomes)
+tmat <- trans.comprisk(k)
+
+# Column names for survival times and event indicators
+tnames <- paste("t", 1:k, sep="")
+dnames <- paste("d", 1:k, sep="")
+
+# Create dlong
+dlong <- data.frame(
+  id = rep(data$id, each = k),
+  Tstart = 0,
+  Tstop = c(t(matrix(unlist(c(data[, tnames])), n, k))),
+  status = c(t(matrix(unlist(c(data[, dnames])), n, k))),
+  from = 1,
+  to = rep(2:(k+1), n),
+  trans = rep(1:k, n)
+)
+
+#add predicotrs
+predictor_names <- grep("^x", names(data), value = TRUE)
+# Add each predictor to the dlong data frame
+for (predictor in predictor_names) {
+  dlong[[predictor]] <- rep(data[[predictor]], each = k)
+}
+
+# Calculate the time
+dlong$time <- dlong$Tstop - dlong$Tstart
+
+# Define the transition matrix and class
+class(dlong) <- c("msdata", "data.frame")
+attr(dlong, "trans") <- tmat
+
+return(dlong)
+}
+```
+
+# Function to chek performance of given model
+
+```{r}
+performance_redrank_model=function(Beta_matrix, model, X, Print_flug) {
+  
+estimated_Gamma <- model$Gamma
+estimated_Alpha = model$Alpha
+estimated_Beta <- estimated_Alpha %*% estimated_Gamma
+
+
+estimated_eta = X %*% estimated_Beta
+real_eta =X  %*% Beta_matrix
+cor_lp=cor(as.vector(estimated_eta),as.vector(real_eta))
+K=dim(estimated_eta)[2]
+lp_errors = rowSums((estimated_eta - real_eta)^2)/K
+ave_lp_error = mean(lp_errors)
+      
+estimated_coefficients <- estimated_Beta   
+true_coefficients <- Beta_matrix 
+
+#correlation coeff
+cor_coeff = cor(as.vector(estimated_Beta),as.vector(true_coefficients))
+# Each coefficient separately
+# bias
+bias <- (estimated_coefficients - true_coefficients)
+# MSE
+mse<- (estimated_coefficients - true_coefficients)^2
+
+
+bias_each_coeff = mean(abs(bias))
+mse_each_coeff = mean(mse)
+
+if (Print_flug == TRUE){
+print(paste('Mean bias takihg each coeff seperatly',bias_each_coeff))
+print(paste('Mean mse taking each coeff seperatly',mse_each_coeff))
+}
+
+
+#For each outcome separately
+
+b_pred=c()
+for (i in 1:k){
+  b_pred[i] = mean(estimated_coefficients[,i]-true_coefficients[,i])
+  if (Print_flug == TRUE){
+  print(paste('Mean bias for outcome',i,': ',b_pred[i]))
+  }
+}
+mse_pred=c()
+for (i in 1:k){
+  mse_pred[i] = mean((estimated_coefficients[,i]-true_coefficients[,i])^2)
+  if (Print_flug == TRUE){
+  print(paste('Mean mse for outcome',i,': ',mse_pred[i]))
+  }
+}
+
+
+return(list(
+    bias_out = bias_each_coeff,
+    mse_out = mse_each_coeff,
+    b_pred = b_pred,
+    mse_pred = mse_pred,
+    cor_coeff = cor_coeff,
+    bias_for_all_coeffs = bias,
+    mse_for_all_coeffs = mse,
+    lp_errors = lp_errors,
+    cor_lp=cor_lp,
+    eta_est=estimated_eta,
+    eta_true=real_eta,
+    ave_lp_error=ave_lp_error
+    
+  ))
+
+}
+```
+
+# Function to simulate n_simulation datasets of given rank r
+
+```{r}
+simulations_data = function(n,p,r,k,n_simulations,case=1,corr=0){
+
+A_matrix=simulate_Beta_matrix(p,r,k,case)$A_matrix
+G_matrix=simulate_Beta_matrix(p,r,k,case)$G_matrix
+Beta_matrix = simulate_Beta_matrix(p,r,k,case)$B_matrix
+
+dlong_list <- vector("list", n_simulations)
+
+X_list <- vector("list", n_simulations)
+
+T_sim_list <- vector("list", n_simulations)
+T_obs_list <- vector("list", n_simulations)
+
+simulation_times = numeric(n_simulations)
+
+for (i in 1:n_simulations){
+  start_time = Sys.time()
+
+  
+  sim_data = simulate_data_redrank_model(Beta_matrix,n,corr)
+  
+  X_list[[i]] = sim_data$X
+  
+  T_sim_list[[i]]= sim_data$T_sim
+  T_obs_list[[i]]= sim_data$T_obs
+
+  data = sim_data$data
+  
+  
+  dlong = preprocess_data_redrank_model(data,k)
+
+  dlong_list[[i]] <- dlong
+  
+  end_time = Sys.time()  
+  simulation_time = as.numeric(difftime(end_time, start_time, units = "secs"))  
+  simulation_times[i] = simulation_time
+  
+  thresh = max(1,n_simulations/10)
+  if ((i%%thresh) == 0){
+    if (i==thresh){
+    print(paste("Time for first", thresh, "datasets:", sum(simulation_times[1:thresh]), "seconds"))
+    }
+    else{
+      print(paste("Time for datasets", (i - (thresh-1)), "to", i, ":", sum(simulation_times[(i - (thresh-1)):i]), "seconds"))
+    }
+  }
+  
+}
+
+print(paste("Time for all", n_simulations, "simulations:", sum(simulation_times), "seconds"))
+
+return(list( dlong_list = dlong_list,
+             Beta_matrix = Beta_matrix,
+             simulation_times = simulation_times,
+             X_list=X_list,
+             T_sim_list= T_sim_list,
+             T_obs_list= T_obs_list,
+             A_matrix=A_matrix,
+             G_matrix=G_matrix
+             ))
+}
+```
+
+#parlial log-likelihood-function in terms of A and G
+
+
+
+
+```{r}
+calculate.log.partial.lik.vec_in_terms_of_A <- function(Alpha_vec, Gamma_vec, data, pred.names, R, K,d,u,rho) {
+  # Reshape Beta_vec into matrix form
+  Alpha <- matrix(Alpha_vec, ncol = R)
+  Gamma <- matrix(Gamma_vec, nrow = R)
+
+  Beta <- Alpha%*%Gamma
+  Beta_vec=as.vector(Beta)
+
+  logliks.strata <- vector(length = K)
+
+  for (trans in 1:K) {
+    data.strata.subs <- data[data$trans == trans,]
+    expr_pred <- paste(pred.names, collapse = " + ")
+    beta_vec <- Beta[,trans]
+
+    expr_mod <- paste("coxph(Surv(Tstart, Tstop, status) ~", expr_pred, ",
+                data = data.strata.subs, init = beta_vec, control = list('iter.max' = 0, timefix = F))")
+    mod <- eval(parse(text = expr_mod))
+
+    logliks.strata[trans] <- mod$loglik[[2]]  # Partial log-likelihood
+  }
+
+  value=-sum(logliks.strata)+rho/2*(norm((Alpha_vec-d+u), type = "2"))^2
+
+  # cat("Current value of a:", Alpha_vec, "\n")
+  # cat("Objective value:", value, "\n")
+
+  return(value)  # Return negative log-likelihood for minimization
+}
+
+
+# Function to compute the gradient numerically
+compute_gradient_loglik_in_terms_of_A <- function(Alpha_vec, Gamma_vec, data, pred.names,R, K, d, u, rho) {
+  grad_vec <- grad(calculate.log.partial.lik.vec_in_terms_of_A, Alpha_vec, Gamma_vec = Gamma_vec,
+                   data = data, pred.names = pred.names, R=R, K = K, d = d, u = u, rho = rho)
+
+   # cat("Current gradient alpha:", grad_vec, "\n")
+
+  return(grad_vec)
+}
+
+
+```
+
+
+
+
+```{r}
+calculate.log.partial.lik.vec_in_terms_of_G <- function(Gamma_vec, Alpha_vec, data, pred.names, R, K,t,u,rho) {
+  # Reshape Beta_vec into matrix form
+  Alpha <- matrix(Alpha_vec, ncol = R)
+  Gamma <- matrix(Gamma_vec, ncol = K)
+  Beta <- Alpha%*%Gamma
+  Beta_vec=as.vector(Beta)
+
+  logliks.strata <- vector(length = K)
+
+  for (trans in 1:K) {
+    data.strata.subs <- data[data$trans == trans,]
+    expr_pred <- paste(pred.names, collapse = " + ")
+    beta_vec <- Beta[,trans]
+
+    expr_mod <- paste("coxph(Surv(Tstart, Tstop, status) ~", expr_pred, ",
+                data = data.strata.subs, init = beta_vec, control = list('iter.max' = 0, timefix = F))")
+    mod <- eval(parse(text = expr_mod))
+
+    logliks.strata[trans] <- mod$loglik[[2]]  # Partial log-likelihood
+  }
+
+  return(-sum(logliks.strata)+rho/2*(norm((Gamma_vec-t+u), type = "2"))^2)  # Return negative log-likelihood for minimization
+}
+
+
+# Function to compute the gradient numerically
+compute_gradient_loglik_in_terms_of_G <- function(Gamma_vec, Alpha_vec, data, pred.names,R, K, t, u, rho) {
+  grad_vec <- grad(calculate.log.partial.lik.vec_in_terms_of_G, Gamma_vec, Alpha_vec = Alpha_vec,
+                   data = data, pred.names = pred.names, R=R, K = K, t = t, u = u, rho = rho)
+  
+  # cat("Current gradient gamma:", grad_vec, "\n")
+  
+  return(grad_vec)
+}
+```
+
+
+
+# Function for lasso penalty using admm
+```{r}
+
+################################################################################
+## Penalized survRRR functions ##
+################################################################################
+
+# The functions pen.survrrr.iter and pen.survrrr go together: 
+# pen.survrrr.iter is a function that goes through a single iteration (estimating Alpha, estimating Gamma)
+# pen.survrrr preps the data and checks if the model has converged
+
+# If I deviate from the default arguments of an existing function (e.g. glmnet),
+# I explicitly include this argument as an argument in the pen.survrrr.iter functions too, without default,
+# to explicitly point this out
+
+library(glmnet)
+library(mstate)
+library(survival)
+
+################################################################################
+
+## Arguments ##
+# redrank: formula object of redrank model 
+# R: number of ranks
+# Gamma.iter: initialization of Gamma matrix
+# dat: data, in mstate long format (e.g with transition matrix as attribute)
+# lambda.alpha: penalization parameter when estimating the Alpha matrix
+# lambda.gamma: penalization parameter when estimating the Gamma matrix
+# overall_eps: convergence criterion 
+# thresh: see ?glmnet (set to default value)
+# maxit: see ?glmnet (set to default value)
+# standardize.opt: whether predictors in glmnet should be standardized prior to fitting the model (set to False!)
+# alpha: see ?glmnet (set to 1: lasso)
+
+
+pen.admm.survrrr <- function(redrank, R, Gamma.iter, dat, lambda.alpha, lambda.gamma, overall_eps, res_tol, maxit = 1e5,  rho=1.0){
+  
+  # get transition matrix and data part from dat object 
+  # Element (i, j) represents the probability of transitioning from state i to state j.
+  trans <- attr(dat, "trans")
+  dat <- as.data.frame(dat)
+  
+  # get model matrices of reduced rank part
+  mmrr <- model.matrix(redrank, data=dat) #takes the formula (redrank) and the data (dat) and creates a matrix of the predictor variables with the addition  of an intercept-appropriate type to be used in fitting a model
+  
+  mmrr <- mmrr[,-1,drop=FALSE] # without intercept-remove it
+  p <- ncol(mmrr) #number of column=number of predictors
+  
+  mmrr <- data.frame(mmrr)
+  covs <- names(mmrr) #names of predictors-covariates
+  
+  rrdata <- as.data.frame(dat[,c("id","from","to","trans","Tstart","Tstop","time","status")]) #selects columns from dat
+  rrdata <- cbind(rrdata,mmrr) #put together the selected columns with the models matrix of predictors
+  cols <- 8 + (1:p) #number of columns-selected ones plus predictors
+  
+  # preparations for iterative algorithm
+  trans2 <- to.trans2(trans) #matrix with transitions in different format
+  K <- nrow(trans2) #number of events 
+  tnames <- paste(trans2$fromname,"->",trans2$toname) #strore transition names
+  
+  # add to the data set R replicates of columns with covariates Z_1...Z_p
+  colsR <- matrix(0,R,p) #matrix Rxp me 0
+  for (r in 1:R) { #to fill the matrix
+    ncd <- ncol(rrdata) #columns of dataset 
+    rrdata <- cbind(rrdata,rrdata[,cols]) #add for second,..,R+1 time all the predictor columns 
+    colsR[r,] <- ((ncd+1):(ncd+p)) #fill rows(1,..,R) of matrix with the col num of the added columns in rrdata 
+    names(rrdata)[((ncd+1):(ncd+p))] <- paste(covs, as.character(r), sep=".rr") #change names of new added columns(add rr.{1,..,r})
+  }
+  
+  #Step 1. in draft paper's algorithm
+  prev.obj.fun.train <- 0
+  obj.fun.train <- 100
+  Delta <- obj.fun.train  - prev.obj.fun.train 
+  
+  #Step 2. in draft paper's algorithm
+  a <- rep(0,p*R)  #rnorm(p*R)
+  d <- rep(0,p*R) 
+  u1 <- rep(0,p*R)
+  t <- rep(0,R*K) 
+  u2 <- rep(0,R*K) 
+  
+
+  
+  output_file_delta <- "output_file_output_file_delta.txt"
+  cat("delta File:\n", file = output_file_delta) 
+  
+  outer_it=1
+  while (abs(Delta) > overall_eps){
+    rr <- pen.admm.survrrr.iter(rrdata=rrdata, Gamma.iter=Gamma.iter, lambda.alpha=lambda.alpha, lambda.gamma=lambda.gamma,
+                           cols=cols, colsR=colsR, K=K, p=p, R=R, trans=trans, pred.names=covs,
+                            res_tol=res_tol,maxit=maxit, rho = rho,a=a,d=d,t=t,u1=u1,u2=u2)
+    prev.obj.fun.train  <- obj.fun.train 
+    obj.fun.train <- rr$obj.fun.train 
+    Delta <-  prev.obj.fun.train - obj.fun.train
+    print(paste0("present value objective function: ", obj.fun.train))
+    print(paste0("Delta: ", Delta))
+    
+    if(Delta < 0) {
+      print("Negative Delta. This should not happen.")
+      break
+    }else{
+      rrcheck <- rr}
+    Gamma.iter = rr$Gamma
+    a=as.vector(rr$Alpha)
+    d=rr$d
+    t=rr$t
+    u1=rr$u1
+    u2=rr$u2
+    
+
+    
+    text <- sprintf("Iteration %d: Delta: %.6f", outer_it, Delta)
+    cat(text, "\n", file = output_file_delta, append = TRUE)
+    
+    outer_it=outer_it+1
+  }
+  
+  return(rrcheck)
+  
+}
+
+################################################################################
+
+## Arguments ##
+# rrdata: data as prepped by pen.survrrr
+# Gamma.iter: Gamma matrix of previous iteration (or initial Gamma if first iteration)
+# lambda.alpha: see pen.survrrr.iter
+# lambda.gamma: see pen.survrrr.iter
+# cols: vector indices of first 8+p columns 
+# colsR: a matrix of dim R*p with the indices of the R copies of the predictors (starting at 8+p+1, directly following cols)
+# K: number of outcomes
+# p: number of predictors 
+# R: see pen.survrrr.iter
+# trans: transition matrix 
+# pred.names: names of predictors 
+# thresh: see pen.survrrr.iter
+# maxit: see pen.survrrr.iter
+# standardize.opt: see pen.survrrr.iter
+# alpha: see pen.survrrr.iter
+# sqrt(sum((-ell_gradient_a(Gamma_matrix, data, Alpha_matrix)+rho*(as.vector(Alpha_matrix)-d+u))^2))
+
+pen.admm.survrrr.iter <- function(rrdata, Gamma.iter, lambda.alpha, lambda.gamma,
+                             cols, colsR, K, p, R, trans, pred.names,res_tol, maxit,  rho,a,d,t,u1,u2){
+  
+  data <- rrdata 
+  
+  
+  ####################### Modified Step 3
+  #initialize a,d,u, r1,s1,n
+ 
+  
+  Gamma_matrix = Gamma.iter
+  Alpha_matrix = matrix(a,p,R)
+  r1 = 100
+  s1 = 100
+
+  
+  output_file_alpha <- "output_file_alpha.txt"
+  cat("Alpha File:\n", file = output_file_alpha)
+
+  for (iter_i in 1:as.integer(maxit)) {
+  # while(r1>=eps2 || s1>=eps3) {
+
+  ## Update a  
+    
+    result <- optim(
+      a,
+      calculate.log.partial.lik.vec_in_terms_of_A,
+      gr = compute_gradient_loglik_in_terms_of_A,
+      Gamma_vec = as.vector(Gamma.iter),
+      data = data,
+      pred.names = pred.names,
+      R = R,
+      K = K,
+      d = d,
+      u = u1,
+      rho = rho,
+      method = "L-BFGS-B",  # Bounded optimization method
+      lower = rep(-4, length(a)),  # Example lower bounds
+      upper = rep(4, length(a)),   # Example upper bounds
+      control = list(pgtol = res_tol, maxit = maxit)
+    )
+    
+    
+    # Optimal Alpha
+    Alpha_matrix <- matrix(result$par, ncol = R) 
+
+
+    
+    a=c(Alpha_matrix)
+
+    cat('gradA:',compute_gradient_loglik_in_terms_of_A(as.vector(Alpha_matrix), as.vector(Gamma.iter), data, pred.names, R, K, d, u1, rho) )
+
+  ## Update d
+    d_old=d
+    d = u1 + a - lambda.alpha*sign(d_old)/rho 
+    # d = u1 + a - gradient_omega1(d, L=1, lambda=lambda.alpha, p, R)/rho
+    
+  ## Update u1
+    u1 = u1 + (a-d)
+    
+    # cat('a:')
+    # print(a)
+    # cat('d:')
+    # print(d)
+    
+  ##Calculate residuals
+    
+    r1 = norm(a-d, type = "2")
+    s1 = rho * norm(d-d_old, type = "2")
+
+    
+    text <- sprintf("Iteration %d: r1: %.6f s1: %.6f rho: %.6f", iter_i, r1, s1,rho)
+    cat(text, "\n", file = output_file_alpha, append = TRUE)
+  
+  
+    print(paste('ri:', r1, 's1:',s1))
+    
+    if (r1  < res_tol && s1 < res_tol) {
+      cat("Alpha Converged: Primal and dual residuals are within tolerance\n")
+      break
+    }
+    
+  }
+  
+  
+  ############### Modified Step 4
+  #initialize gamma,t,u2, r2,s2
+  
+  Gamma_matrix = Gamma.iter
+  
+  coef1 = a
+  
+  
+  gamma <- as.vector(Gamma_matrix) #rnorm(R*K)
+  
+
+  
+  r2 = 100
+  s2 = 100
+  
+  output_file_gamma <- "output_file_gamma.txt"
+  cat("Gamma File:\n", file = output_file_gamma) 
+  
+
+  for (iter_i in 1:as.integer(maxit)) {
+    
+  ## Update gamma
+ 
+    result <- optim(
+      as.vector(Gamma_matrix),
+      calculate.log.partial.lik.vec_in_terms_of_G,
+      gr = compute_gradient_loglik_in_terms_of_G,
+      Alpha_vec = a,
+      data = data,
+      pred.names = pred.names,
+      R = R,
+      K = K,
+      t = t,
+      u = u2,
+      rho = rho,
+      method = "L-BFGS-B",  # Bounded optimization method
+      lower = rep(-4, length(as.vector(Gamma_matrix))),  # Example lower bounds
+      upper = rep(4, length(as.vector(Gamma_matrix))),   # Example upper bounds
+      control = list(pgtol = res_tol, maxit = maxit)
+    )
+    
+    
+
+    
+    # Optimal Gamma
+    Gamma_matrix <- matrix(result$par, ncol = K)  # Reshape back to matrix form
+
+    cat('gradG:',compute_gradient_loglik_in_terms_of_G(as.vector(Gamma_matrix),  a, data, pred.names, R, K, t, u2, rho) )
+    
+    gamma = c(Gamma_matrix)
+  ## Update t
+    t_old=t
+    t  =  gamma+u2-lambda.gamma*sign(t_old)/rho
+    
+  ## Update u2
+    u2= u2 + (gamma-t)
+  ##Calculate residuals
+    r2 = norm(gamma-t, type = "2")
+    s2 =  rho * norm(t-t_old, type = "2")
+
+    
+    # cat('gamma:')
+    # print(gamma)
+    # cat('Gamma_matrix')
+    # print(Gamma_matrix)
+    # cat('t:')
+    # print(t)
+    
+    text <- sprintf("Iteration %d: r2: %.6f s2: %.6f rho: %.6f", iter_i, r2, s2,rho)
+    cat(text, "\n", file = output_file_gamma, append = TRUE)
+    
+    print(paste('r2:', r2, 's2:',s2))
+    
+    
+    if (r2  < res_tol && s2 < res_tol) {
+      cat("Gamma Converged: Primal and dual residuals are within tolerance\n")
+      break
+    }
+
+  }
+  
+
+  
+  coef2 = gamma
+  
+  #calculate objective function
+  Alpha = matrix(a,p,R)
+  Gamma = matrix(gamma,R,K)
+  
+  Beta <- Alpha %*% Gamma
+  
+  
+  
+  cat('Gamma_matrix:')
+  print(Gamma)
+  cat('Alpha_matrix:')
+  print(Alpha)
+  cat('Beta_matrix:')
+  print(Beta)
+    
+    
+  # Step 5
+  logpl <- calculate.log.partial.lik(data=data, Beta=Beta, pred.names=pred.names)
+  
+  obj.fun.train <- - 2 * logpl / nrow(data) + lambda.alpha * sum(abs(coef1)) + lambda.gamma * sum(abs(coef2)) 
+  #-PL(B)^(k+1)+lambda*p(A^(k+1))+lambda*p(G^(k+1)), where p() is the penalty--lasso 
+  
+  print(- 2 * logpl / nrow(data)) #-PL(B)^(k+1)
+  print(lambda.alpha * sum(abs(coef1))) #lambda*p(A^(k+1))
+  print(lambda.gamma * sum(abs(coef2))) #lambda*p(G^(k+1))
+  
+  return(list(Alpha=Alpha, Gamma=Gamma,t=t,d=d,u1=u1,u2=u2, obj.fun.train=obj.fun.train))
+  
+}
+
+
+################################################################################
+
+# Calculate log partial likelihood
+
+## Arguments ##
+# dat: data, in mstate long format (e.g with transition matrix as attribute)
+# Beta: estimated Beta matrix
+# pred.names: names of predictors
+
+calculate.log.partial.lik <- function(data, Beta, pred.names){
+  
+  K <- ncol(Beta) # number of strata/outcomes 
+  logliks.strata <- vector(length = K) #vector with FALSE , k length
+  
+  for (trans in 1:K){
+    
+    data.strata.subs <- data[data$trans == trans,] #select rows of data with trans==trans
+    expr_pred <- paste(pred.names, collapse = " + ") #formula:pred1+pred2+....+predn
+    beta_vec <- Beta[,trans] #column trans of Beta matrix 
+    
+    expr_mod <- paste("coxph(Surv(Tstart, Tstop, status) ~", expr_pred, ",
+                dat = data.strata.subs, init = beta_vec, control=list('iter.max'=0, timefix = F))") #creates expression(string)
+    mod <- eval(parse(text = expr_mod)) #EVAL:  evaluates this expression,parse(text = expr_mod) :converts the string into an R expression.
+    
+    logliks.strata[trans] <- mod$loglik[[2]] #logik of model, Higher (less negative) values indicate a better fit-used for comparissons.
+    
+  }
+  return(sum(logliks.strata))
+}
+```
+
+
+# Function to check if Beta Matrix is close to rank 1
+
+```{r}
+rank_check = function(Beta_m){
+  
+svd_result <- svd(Beta_m)
+
+# Singular values
+singular_values <- svd_result$d
+sigma_1 <- singular_values[1]
+sigma_2 <- singular_values[2]
+
+# Check closeness to rank 1
+ratio <- sigma_2 / sigma_1
+difference <- sigma_1 - sigma_2
+
+
+cat("Singular values:", singular_values, "\n")
+cat("Ratio of singular values:", ratio, "\n")
+cat("Difference between singular values:", difference, "\n")
+
+# Determine if the matrix is close to rank 1
+if (ratio < 0.01) {
+  cat("The matrix is close to rank 1.\n")
+} else {
+  cat("The matrix is not close to rank 1.\n")
+}
+}
+```
+
+
+
+# FIRST Configuration (sample size:500, p=5,k=4, case=1, cor=0, lambda1= 0, n_simulation=1
+
+## Call functions to simulate 1 dataset using rank 1
+
+```{r}
+#set seed
+set.seed(123)
+#chose variables
+n = 500   # Number of observations
+p <- 5  # Number of covariates
+k <- 4  # Number of outcomes
+n_simulations = 1
+
+r <- 1  # Rank of simulated data
+
+
+datas_admm_first1 = simulations_data(n,p,r,k,n_simulations,case = 1,corr = 0)
+
+rank_check(datas_admm_first1$Beta_matrix)
+
+
+dlong <- datas_admm_first1$dlong_list[[1]]
+dlong=dlong[dlong$Tstop > dlong$Tstart, ]
+
+#construct formula for the model
+predictor_names <- grep("^x", names(dlong), value = TRUE)
+formula_str <- paste("Surv(Tstop, status) ~", paste(predictor_names, collapse = " + "))
+formula <- as.formula(formula_str)
+redrank = formula
+
+lambda1= 0
+```
+
+
+### Fit using rank 1
+
+```{r}
+set.seed(123)
+
+nranks_fit = 1
+Gamma.iter<-matrix(rnorm(nranks_fit*k),nranks_fit,k)
+
+start_timefirst111= Sys.time()  
+
+r2_first11 <- redrank(redrank=formula, data = dlong, R = nranks_fit,eps = 1e-5)
+
+end_timefirst111= Sys.time()  
+
+r2_pen.survrrr_first11 <- pen.survrrr(redrank=formula, dat = dlong, R = nranks_fit,
+                              Gamma.iter = Gamma.iter, eps = 1e-5, thresh = 1e-7, maxit = 1e4, lambda.alpha = lambda1, lambda.gamma =  lambda1, standardize.opt = F,alpha = 1)
+
+end_timefirst112= Sys.time()  
+
+r2_pen.admm.survrrr_first11 <- pen.admm.survrrr(formula,  R = nranks_fit, Gamma.iter = Gamma.iter, dat = dlong,
+                                lambda.alpha = lambda1, lambda.gamma = lambda1, overall_eps = 1e-5, res_tol = 1e-7, maxit = 1e4, rho=1)
+
+end_timefirst113 = Sys.time()  
+```
+
+
+
+
+#### Betas
+```{r}
+r2=r2_first11
+r2_pen.survrrr=r2_pen.survrrr_first11
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_first11
+Beta_matrix=datas_admm_first1$Beta_matrix
+datas_s2_1x=datas_admm_first1
+
+Beta1 <- r2$Alpha %*% r2$Gamma
+estimated_coefficients1 <- Beta1
+true_coefficients1 <- Beta_matrix
+mse1<- (estimated_coefficients1 - true_coefficients1)^2
+mean(mse1)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta1 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta2 <- r2_pen.survrrr$Alpha  %*% r2_pen.survrrr$Gamma
+estimated_coefficients2 <- Beta2
+true_coefficients2 <- Beta_matrix
+mse2<- (estimated_coefficients2 - true_coefficients2)^2
+mean(mse2) 
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta2 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+estimated_coefficients3 <- Beta3
+true_coefficients3 <- Beta_matrix
+mse3<- (estimated_coefficients3 - true_coefficients3)^2
+mean(mse3)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta3 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+
+breaks <- seq(min(Beta1,Beta2,Beta3), max(Beta1,Beta2,Beta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+beta_df1 <- reshape2::melt(Beta1)
+beta_df2 <- reshape2::melt(Beta2)
+beta_df3 <- reshape2::melt(Beta3)
+
+beta_df1$Var2=beta_df2$Var2
+
+p1first11 <- ggplot(beta_df1, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm") ) +    
+  ggtitle(str_wrap('Unpenalized survRRR', width = 20))
+
+
+
+
+p2first11  <- ggplot(beta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm") ) +    
+  ggtitle(str_wrap('Penalized survRRR with glmmnet', width = 20))
+
+
+p3first11  <- ggplot(beta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm") ) +    
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+
+```
+
+
+#### etas
+
+
+```{r}
+r2=r2_first11
+r2_pen.survrrr=r2_pen.survrrr_first11
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_first11
+Beta_matrix=datas_admm_first1$Beta_matrix
+datas_s2_1x=datas_admm_first1
+
+Beta1 <- r2$Alpha %*% r2$Gamma
+eta1=datas_s2_1x$X_list[[1]]%*%Beta1
+
+Beta2 <- r2_pen.survrrr$Alpha %*% r2_pen.survrrr$Gamma
+eta2=datas_s2_1x$X_list[[1]]%*%Beta2
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+eta3=datas_s2_1x$X_list[[1]]%*%Beta3
+
+breaks <- seq(min(eta1,eta2,eta3), max(eta1,eta2,eta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+eta_df1 <- reshape2::melt(eta1)
+eta_df2 <- reshape2::melt(eta2)
+eta_df3 <- reshape2::melt(eta3)
+
+eta_df1$Var2=eta_df2$Var2
+
+e1first11 <- ggplot(eta_df1, aes(x = Var2, y = Var1, fill = value)) +
+ geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 3)),  
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm") ) +    
+  ggtitle(str_wrap('Unpenalized survRRR', width = 20))
+
+
+e2first11  <- ggplot(eta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 3)),  
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm") ) +    
+  ggtitle(str_wrap('Penalized survRRR with glmmnet', width = 20))
+
+e3first11  <- ggplot(eta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 3)),  
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),     
+    legend.spacing.x = unit(0, "cm") ) +             
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20)) 
+
+```
+
+
+### Fit using rank 2
+
+```{r}
+set.seed(123)
+
+nranks_fit = 2
+Gamma.iter<-matrix(rnorm(nranks_fit*k),nranks_fit,k)
+
+start_timefirst121= Sys.time()  
+
+r2_first12 <- redrank(redrank=formula, data = dlong, R = nranks_fit,eps = 1e-5)
+
+end_timefirst121= Sys.time()  
+
+r2_pen.survrrr_first12 <- pen.survrrr(redrank=formula, dat = dlong, R = nranks_fit,
+                              Gamma.iter = Gamma.iter, eps = 1e-5, thresh = 1e-7, maxit = 1e4, lambda.alpha = lambda1, lambda.gamma =  lambda1, standardize.opt = F,alpha = 1)
+
+
+end_timefirst122= Sys.time()  
+
+
+r2_pen.admm.survrrr_first12 <- pen.admm.survrrr(formula,  R = nranks_fit, Gamma.iter = Gamma.iter, dat = dlong,
+                                lambda.alpha = lambda1, lambda.gamma = lambda1, overall_eps = 1e-5, res_tol = 1e-7, maxit = 1e4, rho=1)
+
+end_timefirst123= Sys.time()  
+```
+
+
+#### Betas
+
+
+```{r}
+r2=r2_first12
+r2_pen.survrrr=r2_pen.survrrr_first12
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_first12
+Beta_matrix=datas_admm_first1$Beta_matrix
+datas_s2_1x=datas_admm_first1
+
+Beta1 <- r2$Alpha %*% r2$Gamma
+estimated_coefficients1 <- Beta1
+true_coefficients1 <- Beta_matrix
+mse1<- (estimated_coefficients1 - true_coefficients1)^2
+mean(mse1)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta1 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta2 <- r2_pen.survrrr$Alpha  %*% r2_pen.survrrr$Gamma
+estimated_coefficients2 <- Beta2
+true_coefficients2 <- Beta_matrix
+mse2<- (estimated_coefficients2 - true_coefficients2)^2
+mean(mse2) 
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta2 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+estimated_coefficients3 <- Beta3
+true_coefficients3 <- Beta_matrix
+mse3<- (estimated_coefficients3 - true_coefficients3)^2
+mean(mse3)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta3 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+
+breaks <- seq(min(Beta1,Beta2,Beta3), max(Beta1,Beta2,Beta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+beta_df1 <- reshape2::melt(Beta1)
+beta_df2 <- reshape2::melt(Beta2)
+beta_df3 <- reshape2::melt(Beta3)
+
+beta_df1$Var2=beta_df2$Var2
+
+p1first12 <- ggplot(beta_df1, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Unpenalized survRRR', width = 20))
+
+
+p2first12  <- ggplot(beta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20))
+
+p3first12  <- ggplot(beta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+```
+
+
+#### etas
+
+
+```{r}
+r2=r2_first12
+r2_pen.survrrr=r2_pen.survrrr_first12
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_first12
+Beta_matrix=datas_admm_first1$Beta_matrix
+datas_s2_1x=datas_admm_first1
+
+Beta1 <- r2$Alpha %*% r2$Gamma
+eta1=datas_s2_1x$X_list[[1]]%*%Beta1
+
+Beta2 <- r2_pen.survrrr$Alpha %*% r2_pen.survrrr$Gamma
+eta2=datas_s2_1x$X_list[[1]]%*%Beta2
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+eta3=datas_s2_1x$X_list[[1]]%*%Beta3
+
+breaks <- seq(min(eta1,eta2,eta3), max(eta1,eta2,eta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+eta_df1 <- reshape2::melt(eta1)
+eta_df2 <- reshape2::melt(eta2)
+eta_df3 <- reshape2::melt(eta3)
+
+eta_df1$Var2=eta_df2$Var2
+
+e1first12 <- ggplot(eta_df1, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 3)),  
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm") ) +    
+    ggtitle(str_wrap('Unpenalized survRRR', width = 20))
+
+
+e2first12  <- ggplot(eta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 3)),  
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm") ) +    
+    ggtitle(str_wrap('Penalized survRRR with glmmnet', width = 20))
+
+e3first12  <- ggplot(eta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 3)),  
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),     
+    legend.spacing.x = unit(0, "cm") ) +    
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+```
+
+
+## Call functions to simulate 1 dataset using rank 2
+
+```{r}
+#set seed
+set.seed(123)
+#chose variables
+n = 500   # Number of observations
+p <- 5  # Number of covariates
+k <- 4  # Number of outcomes
+n_simulations = 1
+
+r <- 2  # Rank of simulated data
+
+
+datas_admm_first2 = simulations_data(n,p,r,k,n_simulations,case = 1,corr = 0)
+
+rank_check(datas_admm_first2$Beta_matrix)
+
+
+dlong <- datas_admm_first2$dlong_list[[1]]
+dlong=dlong[dlong$Tstop > dlong$Tstart, ]
+
+#construct formula for the model
+predictor_names <- grep("^x", names(dlong), value = TRUE)
+formula_str <- paste("Surv(Tstop, status) ~", paste(predictor_names, collapse = " + "))
+formula <- as.formula(formula_str)
+redrank = formula
+
+lambda1= 0
+```
+
+
+
+### Fit using rank 1
+
+```{r}
+set.seed(123)
+
+nranks_fit = 1
+Gamma.iter<-matrix(rnorm(nranks_fit*k),nranks_fit,k)
+
+start_timefirst211= Sys.time()  
+
+r2_first21 <- redrank(redrank=formula, data = dlong, R = nranks_fit,eps = 1e-5)
+
+end_timefirst211= Sys.time()  
+
+r2_pen.survrrr_first21 <- pen.survrrr(redrank=formula, dat = dlong, R = nranks_fit,
+                              Gamma.iter = Gamma.iter, eps = 1e-5, thresh = 1e-7, maxit = 1e4, lambda.alpha = lambda1, lambda.gamma =  lambda1, standardize.opt = F,alpha = 1)
+
+end_timefirst212= Sys.time()  
+
+r2_pen.admm.survrrr_first21 <- pen.admm.survrrr(formula,  R = nranks_fit, Gamma.iter = Gamma.iter, dat = dlong,
+                                lambda.alpha = lambda1, lambda.gamma = lambda1, overall_eps = 1e-5, res_tol = 1e-7, maxit = 1e4, rho=1)
+
+end_timefirst213= Sys.time()  
+```
+
+
+#### Betas
+
+```{r}
+r2=r2_first21
+r2_pen.survrrr=r2_pen.survrrr_first21
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_first21
+Beta_matrix=datas_admm_first2$Beta_matrix
+datas_s2_1x=datas_admm_first2
+
+Beta1 <- r2$Alpha %*% r2$Gamma
+estimated_coefficients1 <- Beta1
+true_coefficients1 <- Beta_matrix
+mse1<- (estimated_coefficients1 - true_coefficients1)^2
+mean(mse1)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta1 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta2 <- r2_pen.survrrr$Alpha  %*% r2_pen.survrrr$Gamma
+estimated_coefficients2 <- Beta2
+true_coefficients2 <- Beta_matrix
+mse2<- (estimated_coefficients2 - true_coefficients2)^2
+mean(mse2) 
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta2 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+estimated_coefficients3 <- Beta3
+true_coefficients3 <- Beta_matrix
+mse3<- (estimated_coefficients3 - true_coefficients3)^2
+mean(mse3)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta3 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+
+breaks <- seq(min(Beta1,Beta2,Beta3), max(Beta1,Beta2,Beta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+beta_df1 <- reshape2::melt(Beta1)
+beta_df2 <- reshape2::melt(Beta2)
+beta_df3 <- reshape2::melt(Beta3)
+
+beta_df1$Var2=beta_df2$Var2
+
+p1first21 <- ggplot(beta_df1, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Unpenalized survRRR', width = 20))
+
+
+p2first21  <- ggplot(beta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20))
+
+p3first21  <- ggplot(beta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+```
+
+
+#### etas
+
+
+```{r}
+r2=r2_first21
+r2_pen.survrrr=r2_pen.survrrr_first21
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_first21
+Beta_matrix=datas_admm_first2$Beta_matrix
+datas_s2_1x=datas_admm_first2
+
+Beta1 <- r2$Alpha %*% r2$Gamma
+eta1=datas_s2_1x$X_list[[1]]%*%Beta1
+
+Beta2 <- r2_pen.survrrr$Alpha %*% r2_pen.survrrr$Gamma
+eta2=datas_s2_1x$X_list[[1]]%*%Beta2
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+eta3=datas_s2_1x$X_list[[1]]%*%Beta3
+
+breaks <- seq(min(eta1,eta2,eta3), max(eta1,eta2,eta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+eta_df1 <- reshape2::melt(eta1)
+eta_df2 <- reshape2::melt(eta2)
+eta_df3 <- reshape2::melt(eta3)
+
+eta_df1$Var2=eta_df2$Var2
+
+e1first21 <- ggplot(eta_df1, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 3)),  
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),     
+    legend.spacing.x = unit(0, "cm") ) +  
+  ggtitle(str_wrap('Unpenalized survRRR', width = 20))
+
+
+e2first21  <- ggplot(eta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 3)),  
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),     
+    legend.spacing.x = unit(0, "cm") ) +             
+  ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20))
+
+e3first21  <- ggplot(eta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 3)),  
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),     
+    legend.spacing.x = unit(0, "cm") ) +             
+ ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+```
+
+
+### Fit using rank 2
+
+```{r}
+set.seed(123)
+
+nranks_fit = 2
+Gamma.iter<-matrix(rnorm(nranks_fit*k),nranks_fit,k)
+
+start_timefirst221= Sys.time()  
+
+r2_first22 <- redrank(redrank=formula, data = dlong, R = nranks_fit,eps = 1e-5)
+
+end_timefirst221= Sys.time()  
+
+r2_pen.survrrr_first22 <- pen.survrrr(redrank=formula, dat = dlong, R = nranks_fit,
+                              Gamma.iter = Gamma.iter, eps = 1e-5, thresh = 1e-7, maxit = 1e4, lambda.alpha = lambda1, lambda.gamma =  lambda1, standardize.opt = F,alpha = 1)
+
+end_timefirst222= Sys.time()  
+
+r2_pen.admm.survrrr_first22 <- pen.admm.survrrr(formula,  R = nranks_fit, Gamma.iter = Gamma.iter, dat = dlong,
+                                lambda.alpha = lambda1, lambda.gamma = lambda1, overall_eps = 1e-5, res_tol = 1e-7, maxit = 1e4, rho=1)
+
+end_timefirst223= Sys.time()  
+```
+
+#### Betas
+```{r}
+r2=r2_first22
+r2_pen.survrrr=r2_pen.survrrr_first22
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_first22
+Beta_matrix=datas_admm_first2$Beta_matrix
+datas_s2_1x=datas_admm_first2
+
+Beta1 <- r2$Alpha %*% r2$Gamma
+estimated_coefficients1 <- Beta1
+true_coefficients1 <- Beta_matrix
+mse1<- (estimated_coefficients1 - true_coefficients1)^2
+mean(mse1)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta1 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta2 <- r2_pen.survrrr$Alpha  %*% r2_pen.survrrr$Gamma
+estimated_coefficients2 <- Beta2
+true_coefficients2 <- Beta_matrix
+mse2<- (estimated_coefficients2 - true_coefficients2)^2
+mean(mse2) 
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta2 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+estimated_coefficients3 <- Beta3
+true_coefficients3 <- Beta_matrix
+mse3<- (estimated_coefficients3 - true_coefficients3)^2
+mean(mse3)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta3 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+
+breaks <- seq(min(Beta1,Beta2,Beta3), max(Beta1,Beta2,Beta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+beta_df1 <- reshape2::melt(Beta1)
+beta_df2 <- reshape2::melt(Beta2)
+beta_df3 <- reshape2::melt(Beta3)
+
+beta_df1$Var2=beta_df2$Var2
+
+p1first22 <- ggplot(beta_df1, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Unpenalized survRRR', width = 20))
+
+
+p2first22  <- ggplot(beta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20))
+
+p3first22  <- ggplot(beta_df3, aes(x = Var2, y = Var1, fill = value)) +
+ geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+```
+
+
+#### etas
+
+
+```{r}
+r2=r2_first22
+r2_pen.survrrr=r2_pen.survrrr_first22
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_first22
+Beta_matrix=datas_admm_first2$Beta_matrix
+datas_s2_1x=datas_admm_first2
+
+Beta1 <- r2$Alpha %*% r2$Gamma
+eta1=datas_s2_1x$X_list[[1]]%*%Beta1
+
+Beta2 <- r2_pen.survrrr$Alpha %*% r2_pen.survrrr$Gamma
+eta2=datas_s2_1x$X_list[[1]]%*%Beta2
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+eta3=datas_s2_1x$X_list[[1]]%*%Beta3
+
+breaks <- seq(min(eta1,eta2,eta3), max(eta1,eta2,eta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+eta_df1 <- reshape2::melt(eta1)
+eta_df2 <- reshape2::melt(eta2)
+eta_df3 <- reshape2::melt(eta3)
+
+eta_df1$Var2=eta_df2$Var2
+
+e1first22 <- ggplot(eta_df1, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 3)),  
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),     
+    legend.spacing.x = unit(0, "cm") ) +     
+  ggtitle(str_wrap('Unpenalized survRRR', width = 20))
+
+
+e2first22  <- ggplot(eta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 3)),  
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),     
+    legend.spacing.x = unit(0, "cm") ) +     
+  ggtitle(str_wrap('Penalized survRRR with glmmnet', width = 20))
+
+e3first22  <- ggplot(eta_df3, aes(x = Var2, y = Var1, fill = value)) +
+ geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 3)),  
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),     
+    legend.spacing.x = unit(0, "cm") ) +     
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+```
+
+## PLOTS
+
+
+```{r}
+combined_plot <- (p1first11 + p2first11 + p3first11) / (p1first12 + p2first12 + p3first12) / (p1first21 + p2first21 + p3first21) / (p1first21 + p2first21 + p3first21)+
+  plot_annotation(
+    title = "Estimated B by each model for:\nn=500, p=5, K=4, case=1, cor=0, λ=0",
+    subtitle = c("First row: Data simulated with rank 1 and fitted with rank 1\nSecond row: Data simulated with rank 1 and fitted with rank 2\nThird row: Data simulated with rank 2 and fitted with rank 1\nFourth row: Data simulated with rank 2 and fitted with rank 2"),
+    theme = theme(
+      plot.title = element_text(size = 20, hjust = 0.5),
+      plot.subtitle = element_text(size = 14, hjust = 0)
+    )
+  )
+
+
+combined_plot2 <- (e1first11 + e2first11 + e3first11) / (e1first12 + e2first12 + e3first12) / (e1first21 + e2first21 + e3first21) / (e1first21 + e2first21 + e3first21)+
+  plot_annotation(
+    title = "Estimated η=ZB by each model for:\nn=500, p=5, K=4, case=1, cor=0, λ=0",
+    subtitle = c("First row: Data simulated with rank 1 and fitted with rank 1\nSecond row: Data simulated with rank 1 and fitted with rank 2\nThird row: Data simulated with rank 2 and fitted with rank 1\nFourth row: Data simulated with rank 2 and fitted with rank 2"),
+    theme = theme(
+      plot.title = element_text(size = 20, hjust = 0.5),
+      plot.subtitle = element_text(size = 14, hjust = 0)
+    )
+  )
+
+ggsave("admm_first_b.png", combined_plot, width = 6, height = 7)
+ggsave("admm_first_e.png", combined_plot2, width = 6, height = 7)
+```
+
+
+
+# SECOND Configuration (sample size:500, p=5,k=4, case=1, cor=0, lambda1= 1e-4, n_simulation=1
+
+## Call functions to simulate 1 dataset using rank 1
+
+```{r}
+#set seed
+set.seed(123)
+#chose variables
+n = 500   # Number of observations
+p <- 5  # Number of covariates
+k <- 4  # Number of outcomes
+n_simulations = 1
+
+r <- 1  # Rank of simulated data
+
+
+datas_admm_second1 = simulations_data(n,p,r,k,n_simulations,case = 1,corr = 0)
+
+rank_check(datas_admm_second1$Beta_matrix)
+
+
+dlong <- datas_admm_second1$dlong_list[[1]]
+dlong=dlong[dlong$Tstop > dlong$Tstart, ]
+
+#construct formula for the model
+predictor_names <- grep("^x", names(dlong), value = TRUE)
+formula_str <- paste("Surv(Tstop, status) ~", paste(predictor_names, collapse = " + "))
+formula <- as.formula(formula_str)
+redrank = formula
+
+lambda1= 1e-4
+```
+
+
+### Fit using rank 1
+
+```{r}
+set.seed(123)
+
+nranks_fit = 1
+Gamma.iter<-matrix(rnorm(nranks_fit*k),nranks_fit,k)
+
+
+end_timesecond111= Sys.time()  
+
+r2_pen.survrrr_second11 <- pen.survrrr(redrank=formula, dat = dlong, R = nranks_fit,
+                              Gamma.iter = Gamma.iter, eps = 1e-5, thresh = 1e-7, maxit = 1e4, lambda.alpha = lambda1, lambda.gamma =  lambda1, standardize.opt = F,alpha = 1)
+
+end_timesecond112= Sys.time()  
+
+r2_pen.admm.survrrr_second11 <- pen.admm.survrrr(formula,  R = nranks_fit, Gamma.iter = Gamma.iter, dat = dlong,
+                                lambda.alpha = lambda1, lambda.gamma = lambda1, overall_eps = 1e-5, res_tol = 1e-7, maxit = 1e4, rho=1)
+
+end_timesecond113= Sys.time()  
+```
+
+#### Betas
+```{r}
+r2_pen.survrrr=r2_pen.survrrr_second11
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_second11
+Beta_matrix=datas_admm_second1$Beta_matrix
+datas_s2_1x=datas_admm_second1
+
+Beta2 <- r2_pen.survrrr$Alpha  %*% r2_pen.survrrr$Gamma
+estimated_coefficients2 <- Beta2
+true_coefficients2 <- Beta_matrix
+mse2<- (estimated_coefficients2 - true_coefficients2)^2
+mean(mse2) 
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta2 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+estimated_coefficients3 <- Beta3
+true_coefficients3 <- Beta_matrix
+mse3<- (estimated_coefficients3 - true_coefficients3)^2
+mean(mse3)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta3 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+
+breaks <- seq(min(Beta2,Beta3), max(Beta2,Beta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+beta_df2 <- reshape2::melt(Beta2)
+beta_df3 <- reshape2::melt(Beta3)
+
+
+
+p2second11 <- ggplot(beta_df2, aes(x = Var2, y = Var1, fill = value)) +
+ geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmmnet', width = 20))
+
+p3second11  <- ggplot(beta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+```
+
+
+#### etas
+
+
+```{r}
+r2_pen.survrrr=r2_pen.survrrr_second11
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_second11
+Beta_matrix=datas_admm_second1$Beta_matrix
+datas_s2_1x=datas_admm_second1
+
+
+Beta2 <- r2_pen.survrrr$Alpha %*% r2_pen.survrrr$Gamma
+eta2=datas_s2_1x$X_list[[1]]%*%Beta2
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+eta3=datas_s2_1x$X_list[[1]]%*%Beta3
+
+breaks <- seq(min(eta2,eta3), max(eta2,eta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+eta_df2 <- reshape2::melt(eta2)
+eta_df3 <- reshape2::melt(eta3)
+
+
+
+e2second11  <- ggplot(eta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmmnet', width = 20))
+
+e3second11  <- ggplot(eta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+```
+
+
+### Fit using rank 2
+
+```{r}
+set.seed(123)
+
+nranks_fit = 2
+Gamma.iter<-matrix(rnorm(nranks_fit*k),nranks_fit,k)
+
+
+
+end_timesecond121= Sys.time()  
+
+r2_pen.survrrr_second12 <- pen.survrrr(redrank=formula, dat = dlong, R = nranks_fit,
+                              Gamma.iter = Gamma.iter, eps = 1e-5, thresh = 1e-7, maxit = 1e4, lambda.alpha = lambda1, lambda.gamma =  lambda1, standardize.opt = F,alpha = 1)
+
+end_timesecond122= Sys.time()  
+
+r2_pen.admm.survrrr_second12 <- pen.admm.survrrr(formula,  R = nranks_fit, Gamma.iter = Gamma.iter, dat = dlong,
+                                lambda.alpha = lambda1, lambda.gamma = lambda1, overall_eps = 1e-5, res_tol = 1e-7, maxit = 1e4, rho=1)
+
+end_timesecond123= Sys.time()  
+```
+
+
+
+#### Betas
+```{r}
+r2_pen.survrrr=r2_pen.survrrr_second12
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_second12
+Beta_matrix=datas_admm_second1$Beta_matrix
+datas_s2_1x=datas_admm_second1
+
+
+Beta2 <- r2_pen.survrrr$Alpha  %*% r2_pen.survrrr$Gamma
+estimated_coefficients2 <- Beta2
+true_coefficients2 <- Beta_matrix
+mse2<- (estimated_coefficients2 - true_coefficients2)^2
+mean(mse2) 
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta2 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+estimated_coefficients3 <- Beta3
+true_coefficients3 <- Beta_matrix
+mse3<- (estimated_coefficients3 - true_coefficients3)^2
+mean(mse3)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta3 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+
+breaks <- seq(min(Beta2,Beta3), max(Beta2,Beta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+beta_df2 <- reshape2::melt(Beta2)
+beta_df3 <- reshape2::melt(Beta3)
+
+
+
+p2second12 <- ggplot(beta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmmnet', width = 20))
+
+p3second12  <- ggplot(beta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+```
+
+
+#### etas
+
+
+```{r}
+r2_pen.survrrr=r2_pen.survrrr_second12
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_second12
+Beta_matrix=datas_admm_second1$Beta_matrix
+datas_s2_1x=datas_admm_second1
+
+
+Beta2 <- r2_pen.survrrr$Alpha %*% r2_pen.survrrr$Gamma
+eta2=datas_s2_1x$X_list[[1]]%*%Beta2
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+eta3=datas_s2_1x$X_list[[1]]%*%Beta3
+
+breaks <- seq(min(eta2,eta3), max(eta2,eta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+eta_df2 <- reshape2::melt(eta2)
+eta_df3 <- reshape2::melt(eta3)
+
+
+e2second12  <- ggplot(eta_df2, aes(x = Var2, y = Var1, fill = value)) +
+ geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20))
+
+e3second12  <- ggplot(eta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+```
+
+
+## Call functions to simulate 1 dataset using rank 2
+
+```{r}
+#set seed
+set.seed(123)
+#chose variables
+n = 500   # Number of observations
+p <- 5  # Number of covariates
+k <- 4  # Number of outcomes
+n_simulations = 1
+
+r <- 2  # Rank of simulated data
+
+
+datas_admm_second2 = simulations_data(n,p,r,k,n_simulations,case = 1,corr = 0)
+
+rank_check(datas_admm_second2$Beta_matrix)
+
+
+dlong <- datas_admm_second2$dlong_list[[1]]
+dlong=dlong[dlong$Tstop > dlong$Tstart, ]
+
+#construct formula for the model
+predictor_names <- grep("^x", names(dlong), value = TRUE)
+formula_str <- paste("Surv(Tstop, status) ~", paste(predictor_names, collapse = " + "))
+formula <- as.formula(formula_str)
+redrank = formula
+
+lambda1= 1e-4
+```
+
+
+
+### Fit using rank 1
+
+```{r}
+set.seed(123)
+
+nranks_fit = 1
+Gamma.iter<-matrix(rnorm(nranks_fit*k),nranks_fit,k)
+
+
+
+end_timesecond211= Sys.time()  
+
+r2_pen.survrrr_second21 <- pen.survrrr(redrank=formula, dat = dlong, R = nranks_fit,
+                              Gamma.iter = Gamma.iter, eps = 1e-5, thresh = 1e-7, maxit = 1e4, lambda.alpha = lambda1, lambda.gamma =  lambda1, standardize.opt = F,alpha = 1)
+
+end_timesecond212= Sys.time()  
+
+r2_pen.admm.survrrr_second21 <- pen.admm.survrrr(formula,  R = nranks_fit, Gamma.iter = Gamma.iter, dat = dlong,
+                                lambda.alpha = lambda1, lambda.gamma = lambda1, overall_eps = 1e-5, res_tol = 1e-7, maxit = 1e4, rho=1)
+
+end_timesecond213= Sys.time()  
+```
+
+#### Betas
+```{r}
+r2_pen.survrrr=r2_pen.survrrr_second21
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_second21
+Beta_matrix=datas_admm_second2$Beta_matrix
+datas_s2_1x=datas_admm_second2
+
+
+Beta2 <- r2_pen.survrrr$Alpha  %*% r2_pen.survrrr$Gamma
+estimated_coefficients2 <- Beta2
+true_coefficients2 <- Beta_matrix
+mse2<- (estimated_coefficients2 - true_coefficients2)^2
+mean(mse2) 
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta2 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+estimated_coefficients3 <- Beta3
+true_coefficients3 <- Beta_matrix
+mse3<- (estimated_coefficients3 - true_coefficients3)^2
+mean(mse3)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta3 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+
+breaks <- seq(min(Beta2,Beta3), max(Beta2,Beta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+beta_df2 <- reshape2::melt(Beta2)
+beta_df3 <- reshape2::melt(Beta3)
+
+
+
+p2second21 <- ggplot(beta_df2, aes(x = Var2, y = Var1, fill = value)) +
+ geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # 
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20))
+
+p3second21  <- ggplot(beta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # 
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+```
+
+
+#### etas
+
+
+```{r}
+r2_pen.survrrr=r2_pen.survrrr_second21
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_second21
+Beta_matrix=datas_admm_second2$Beta_matrix
+datas_s2_1x=datas_admm_second2
+
+
+
+Beta2 <- r2_pen.survrrr$Alpha %*% r2_pen.survrrr$Gamma
+eta2=datas_s2_1x$X_list[[1]]%*%Beta2
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+eta3=datas_s2_1x$X_list[[1]]%*%Beta3
+
+breaks <- seq(min(eta2,eta3), max(eta2,eta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+eta_df2 <- reshape2::melt(eta2)
+eta_df3 <- reshape2::melt(eta3)
+
+
+
+e2second21  <- ggplot(eta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # 
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20))
+
+e3second21 <- ggplot(eta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # 
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+```
+
+
+### Fit using rank 2
+
+```{r}
+set.seed(123)
+
+nranks_fit = 2
+Gamma.iter<-matrix(rnorm(nranks_fit*k),nranks_fit,k)
+
+end_timesecond221= Sys.time()  
+
+r2_pen.survrrr_second22 <- pen.survrrr(redrank=formula, dat = dlong, R = nranks_fit,
+                              Gamma.iter = Gamma.iter, eps = 1e-5, thresh = 1e-7, maxit = 1e4, lambda.alpha = lambda1, lambda.gamma =  lambda1, standardize.opt = F,alpha = 1)
+
+end_timesecond222= Sys.time()  
+
+r2_pen.admm.survrrr_second22 <- pen.admm.survrrr(formula,  R = nranks_fit, Gamma.iter = Gamma.iter, dat = dlong,
+                                lambda.alpha = lambda1, lambda.gamma = lambda1, overall_eps = 1e-5, res_tol = 1e-7, maxit = 1e4, rho=1)
+
+end_timesecond223= Sys.time()  
+```
+
+
+
+#### Betas
+```{r}
+r2_pen.survrrr=r2_pen.survrrr_second22
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_second22
+Beta_matrix=datas_admm_second2$Beta_matrix
+datas_s2_1x=datas_admm_second2
+
+
+Beta2 <- r2_pen.survrrr$Alpha  %*% r2_pen.survrrr$Gamma
+estimated_coefficients2 <- Beta2
+true_coefficients2 <- Beta_matrix
+mse2<- (estimated_coefficients2 - true_coefficients2)^2
+mean(mse2) 
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta2 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+estimated_coefficients3 <- Beta3
+true_coefficients3 <- Beta_matrix
+mse3<- (estimated_coefficients3 - true_coefficients3)^2
+mean(mse3)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta3 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+
+breaks <- seq(min(Beta2,Beta3), max(Beta2,Beta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+beta_df2 <- reshape2::melt(Beta2)
+beta_df3 <- reshape2::melt(Beta3)
+
+
+
+p2second22 <- ggplot(beta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # 
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+ ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20))
+
+p3second22  <- ggplot(beta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # 
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+```
+
+
+#### etas
+
+
+```{r}
+r2_pen.survrrr=r2_pen.survrrr_second22
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_second22
+Beta_matrix=datas_admm_second2$Beta_matrix
+datas_s2_1x=datas_admm_second2
+
+
+Beta2 <- r2_pen.survrrr$Alpha %*% r2_pen.survrrr$Gamma
+eta2=datas_s2_1x$X_list[[1]]%*%Beta2
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+eta3=datas_s2_1x$X_list[[1]]%*%Beta3
+
+breaks <- seq(min(eta2,eta3), max(eta2,eta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+eta_df2 <- reshape2::melt(eta2)
+eta_df3 <- reshape2::melt(eta3)
+
+
+e2second22  <- ggplot(eta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # 
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20))
+
+e3second22 <- ggplot(eta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # 
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20))
+
+```
+
+
+
+## PLOTS
+
+
+```{r}
+
+combined_plot <- ( p2second11 + p3second11) / (p2second12 + p3second12) / ( p2second21 + p3second21) / (p2second21 + p3second21)+
+
+  plot_annotation(
+    title = "Estimated B by each model for:\nn=500, p=5, K=4, case=1, cor=0, λ=0.0001",
+    subtitle = c("First row: Data simulated with rank 1 and fitted with rank 1\nSecond row: Data simulated with rank 1 and fitted with rank 2\nThird row: Data simulated with rank 2 and fitted with rank 1\nFourth row: Data simulated with rank 2 and fitted with rank 2"),
+    theme = theme(
+      plot.title = element_text(size = 20, hjust = 0.5),
+      plot.subtitle = element_text(size = 14, hjust = 0)
+    )
+  )
+
+
+combined_plot2 <- (e2second11 + e3second11) / (e2second12 + e3second12) / ( e2second21 + e3second21) / ( e2second21 + e3second21)+
+
+  plot_annotation(
+    title = "Estimated η=ZB by each model for:\nn=500, p=5, K=4, case=1, cor=0, λ=0.0001",
+    subtitle = c("First row: Data simulated with rank 1 and fitted with rank 1\nSecond row: Data simulated with rank 1 and fitted with rank 2\nThird row: Data simulated with rank 2 and fitted with rank 1\nFourth row: Data simulated with rank 2 and fitted with rank 2"),
+    theme = theme(
+      plot.title = element_text(size = 20, hjust = 0.5),
+      plot.subtitle = element_text(size = 14, hjust = 0)
+    )
+  )
+
+ggsave("admm_second_b.png", combined_plot, width = 6, height = 7)
+ggsave("admm_second_e.png", combined_plot2, width = 6, height = 7)
+```
+
+
+# THIRD Configuration (sample size:500, p=5,k=4, case=1, cor=0.7, lambda1= 0, n_simulation=1
+
+## Call functions to simulate 1 dataset using rank 1
+
+```{r}
+#set seed
+set.seed(123)
+#chose variables
+n = 500   # Number of observations
+p <- 5  # Number of covariates
+k <- 4  # Number of outcomes
+n_simulations = 1
+
+r <- 1  # Rank of simulated data
+
+
+datas_admm_third1 = simulations_data(n,p,r,k,n_simulations,case = 1,corr = 0.7)
+
+rank_check(datas_admm_third1$Beta_matrix)
+
+
+dlong <- datas_admm_third1$dlong_list[[1]]
+dlong=dlong[dlong$Tstop > dlong$Tstart, ]
+
+#construct formula for the model
+predictor_names <- grep("^x", names(dlong), value = TRUE)
+formula_str <- paste("Surv(Tstop, status) ~", paste(predictor_names, collapse = " + "))
+formula <- as.formula(formula_str)
+redrank = formula
+
+lambda1= 0
+```
+
+
+### Fit using rank 1
+
+```{r}
+set.seed(123)
+
+nranks_fit = 1
+Gamma.iter<-matrix(rnorm(nranks_fit*k),nranks_fit,k)
+start_timesthird111= Sys.time()  
+
+r2_third11 <- redrank(redrank=formula, data = dlong, R = nranks_fit,eps = 1e-5)
+end_timesthird111= Sys.time()  
+
+r2_pen.survrrr_third11 <- pen.survrrr(redrank=formula, dat = dlong, R = nranks_fit,
+                              Gamma.iter = Gamma.iter, eps = 1e-5, thresh = 1e-7, maxit = 1e4, lambda.alpha = lambda1, lambda.gamma =  lambda1, standardize.opt = F,alpha = 1)
+
+end_timesthird112= Sys.time()  
+
+r2_pen.admm.survrrr_third11 <- pen.admm.survrrr(formula,  R = nranks_fit, Gamma.iter = Gamma.iter, dat = dlong,
+                                lambda.alpha = lambda1, lambda.gamma = lambda1, overall_eps = 1e-5, res_tol = 1e-7, maxit = 1e4, rho=1)
+
+end_timesthird113= Sys.time()  
+```
+
+#### Betas
+```{r}
+r2=r2_third11
+r2_pen.survrrr=r2_pen.survrrr_third11
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_third11
+Beta_matrix=datas_admm_third1$Beta_matrix
+datas_s2_1x=datas_admm_third1
+
+Beta1 <- r2$Alpha %*% r2$Gamma
+estimated_coefficients1 <- Beta1
+true_coefficients1 <- Beta_matrix
+mse1<- (estimated_coefficients1 - true_coefficients1)^2
+mean(mse1)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta1 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta2 <- r2_pen.survrrr$Alpha  %*% r2_pen.survrrr$Gamma
+estimated_coefficients2 <- Beta2
+true_coefficients2 <- Beta_matrix
+mse2<- (estimated_coefficients2 - true_coefficients2)^2
+mean(mse2) 
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta2 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+estimated_coefficients3 <- Beta3
+true_coefficients3 <- Beta_matrix
+mse3<- (estimated_coefficients3 - true_coefficients3)^2
+mean(mse3)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta3 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+
+breaks <- seq(min(Beta1,Beta2,Beta3), max(Beta1,Beta2,Beta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+beta_df1 <- reshape2::melt(Beta1)
+beta_df2 <- reshape2::melt(Beta2)
+beta_df3 <- reshape2::melt(Beta3)
+
+beta_df1$Var2=beta_df2$Var2
+
+p1third11 <- ggplot(beta_df1, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+   ggtitle(str_wrap('Unpenalized survRRR', width = 20)) 
+
+
+p2third11 <- ggplot(beta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+   ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20)) 
+
+p3third11  <- ggplot(beta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+   ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20)) 
+
+```
+
+
+#### etas
+
+
+```{r}
+r2=r2_third11
+r2_pen.survrrr=r2_pen.survrrr_third11
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_third11
+Beta_matrix=datas_admm_third1$Beta_matrix
+datas_s2_1x=datas_admm_third1
+
+Beta1 <- r2$Alpha %*% r2$Gamma
+eta1=datas_s2_1x$X_list[[1]]%*%Beta1
+
+Beta2 <- r2_pen.survrrr$Alpha %*% r2_pen.survrrr$Gamma
+eta2=datas_s2_1x$X_list[[1]]%*%Beta2
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+eta3=datas_s2_1x$X_list[[1]]%*%Beta3
+
+breaks <- seq(min(eta1,eta2,eta3), max(eta1,eta2,eta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+eta_df1 <- reshape2::melt(eta1)
+eta_df2 <- reshape2::melt(eta2)
+eta_df3 <- reshape2::melt(eta3)
+
+eta_df1$Var2=eta_df2$Var2
+
+e1third11 <- ggplot(eta_df1, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+ ggtitle(str_wrap('Unpenalized survRRR', width = 20)) 
+
+
+e2third11  <- ggplot(eta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20)) 
+
+e3third11  <- ggplot(eta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20)) 
+
+```
+
+### Fit using rank 2
+
+```{r}
+set.seed(123)
+
+nranks_fit = 2
+Gamma.iter<-matrix(rnorm(nranks_fit*k),nranks_fit,k)
+
+start_timesthird121= Sys.time()  
+
+r2_third12 <- redrank(redrank=formula, data = dlong, R = nranks_fit,eps = 1e-5)
+
+end_timesthird121= Sys.time()  
+
+r2_pen.survrrr_third12 <- pen.survrrr(redrank=formula, dat = dlong, R = nranks_fit,
+                              Gamma.iter = Gamma.iter, eps = 1e-5, thresh = 1e-7, maxit = 1e4, lambda.alpha = lambda1, lambda.gamma =  lambda1, standardize.opt = F,alpha = 1)
+
+end_timesthird122= Sys.time()  
+
+r2_pen.admm.survrrr_third12 <- pen.admm.survrrr(formula,  R = nranks_fit, Gamma.iter = Gamma.iter, dat = dlong,
+                                lambda.alpha = lambda1, lambda.gamma = lambda1, overall_eps = 1e-5, res_tol = 1e-7, maxit = 1e4, rho=1)
+end_timesthird123= Sys.time()  
+```
+
+#### Betas
+```{r}
+r2=r2_third12
+r2_pen.survrrr=r2_pen.survrrr_third12
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_third12
+Beta_matrix=datas_admm_third1$Beta_matrix
+datas_s2_1x=datas_admm_third1
+
+Beta1 <- r2$Alpha %*% r2$Gamma
+estimated_coefficients1 <- Beta1
+true_coefficients1 <- Beta_matrix
+mse1<- (estimated_coefficients1 - true_coefficients1)^2
+mean(mse1)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta1 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta2 <- r2_pen.survrrr$Alpha  %*% r2_pen.survrrr$Gamma
+estimated_coefficients2 <- Beta2
+true_coefficients2 <- Beta_matrix
+mse2<- (estimated_coefficients2 - true_coefficients2)^2
+mean(mse2) 
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta2 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+estimated_coefficients3 <- Beta3
+true_coefficients3 <- Beta_matrix
+mse3<- (estimated_coefficients3 - true_coefficients3)^2
+mean(mse3)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta3 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+
+breaks <- seq(min(Beta1,Beta2,Beta3), max(Beta1,Beta2,Beta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+beta_df1 <- reshape2::melt(Beta1)
+beta_df2 <- reshape2::melt(Beta2)
+beta_df3 <- reshape2::melt(Beta3)
+
+beta_df1$Var2=beta_df2$Var2
+
+p1third12 <- ggplot(beta_df1, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+ ggtitle(str_wrap('Unpenalized survRRR', width = 20)) 
+
+
+p2third12 <- ggplot(beta_df2, aes(x = Var2, y = Var1, fill = value)) +
+ geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20)) 
+
+p3third12  <- ggplot(beta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20)) 
+
+```
+
+
+#### etas
+
+
+```{r}
+r2=r2_third12
+r2_pen.survrrr=r2_pen.survrrr_third12
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_third12
+Beta_matrix=datas_admm_third1$Beta_matrix
+datas_s2_1x=datas_admm_third1
+
+Beta1 <- r2$Alpha %*% r2$Gamma
+eta1=datas_s2_1x$X_list[[1]]%*%Beta1
+
+Beta2 <- r2_pen.survrrr$Alpha %*% r2_pen.survrrr$Gamma
+eta2=datas_s2_1x$X_list[[1]]%*%Beta2
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+eta3=datas_s2_1x$X_list[[1]]%*%Beta3
+
+breaks <- seq(min(eta1,eta2,eta3), max(eta1,eta2,eta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+eta_df1 <- reshape2::melt(eta1)
+eta_df2 <- reshape2::melt(eta2)
+eta_df3 <- reshape2::melt(eta3)
+
+eta_df1$Var2=eta_df2$Var2
+
+e1third12 <- ggplot(eta_df1, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Unpenalized survRRR', width = 20)) 
+
+
+e2third12  <- ggplot(eta_df2, aes(x = Var2, y = Var1, fill = value)) +
+ geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20)) 
+
+e3third12  <- ggplot(eta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+ ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20)) 
+
+```
+
+
+## Call functions to simulate 1 dataset using rank 2
+
+```{r}
+#set seed
+set.seed(123)
+#chose variables
+n = 500   # Number of observations
+p <- 5  # Number of covariates
+k <- 4  # Number of outcomes
+n_simulations = 1
+
+r <- 2  # Rank of simulated data
+
+
+datas_admm_third2 = simulations_data(n,p,r,k,n_simulations,case = 1,corr = 0.7)
+
+rank_check(datas_admm_third2$Beta_matrix)
+
+
+dlong <- datas_admm_third2$dlong_list[[1]]
+dlong=dlong[dlong$Tstop > dlong$Tstart, ]
+
+#construct formula for the model
+predictor_names <- grep("^x", names(dlong), value = TRUE)
+formula_str <- paste("Surv(Tstop, status) ~", paste(predictor_names, collapse = " + "))
+formula <- as.formula(formula_str)
+redrank = formula
+
+lambda1= 0
+```
+
+
+
+### Fit using rank 1
+
+```{r}
+set.seed(123)
+
+nranks_fit = 1
+Gamma.iter<-matrix(rnorm(nranks_fit*k),nranks_fit,k)
+
+start_timesthird211= Sys.time()  
+
+r2_third21 <- redrank(redrank=formula, data = dlong, R = nranks_fit,eps = 1e-5)
+
+end_timesthird211= Sys.time()  
+
+r2_pen.survrrr_third21 <- pen.survrrr(redrank=formula, dat = dlong, R = nranks_fit,
+                              Gamma.iter = Gamma.iter, eps = 1e-5, thresh = 1e-7, maxit = 1e4, lambda.alpha = lambda1, lambda.gamma =  lambda1, standardize.opt = F,alpha = 1)
+
+
+end_timesthird212= Sys.time()  
+
+r2_pen.admm.survrrr_third21 <- pen.admm.survrrr(formula,  R = nranks_fit, Gamma.iter = Gamma.iter, dat = dlong,
+                                lambda.alpha = lambda1, lambda.gamma = lambda1, overall_eps = 1e-5, res_tol = 1e-7, maxit = 1e4, rho=1)
+
+end_timesthird213= Sys.time()  
+```
+
+
+#### Betas
+```{r}
+r2=r2_third21
+r2_pen.survrrr=r2_pen.survrrr_third21
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_third21
+Beta_matrix=datas_admm_third2$Beta_matrix
+datas_s2_1x=datas_admm_third2
+
+Beta1 <- r2$Alpha %*% r2$Gamma
+estimated_coefficients1 <- Beta1
+true_coefficients1 <- Beta_matrix
+mse1<- (estimated_coefficients1 - true_coefficients1)^2
+mean(mse1)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta1 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta2 <- r2_pen.survrrr$Alpha  %*% r2_pen.survrrr$Gamma
+estimated_coefficients2 <- Beta2
+true_coefficients2 <- Beta_matrix
+mse2<- (estimated_coefficients2 - true_coefficients2)^2
+mean(mse2) 
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta2 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+estimated_coefficients3 <- Beta3
+true_coefficients3 <- Beta_matrix
+mse3<- (estimated_coefficients3 - true_coefficients3)^2
+mean(mse3)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta3 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+
+breaks <- seq(min(Beta1,Beta2,Beta3), max(Beta1,Beta2,Beta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+beta_df1 <- reshape2::melt(Beta1)
+beta_df2 <- reshape2::melt(Beta2)
+beta_df3 <- reshape2::melt(Beta3)
+
+beta_df1$Var2=beta_df2$Var2
+
+p1third21 <- ggplot(beta_df1, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Unpenalized survRRR', width = 20)) 
+
+
+p2third21 <- ggplot(beta_df2, aes(x = Var2, y = Var1, fill = value)) +
+ geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+ ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20)) 
+
+p3third21 <- ggplot(beta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20)) 
+
+```
+
+
+#### etas
+
+
+```{r}
+r2=r2_third21
+r2_pen.survrrr=r2_pen.survrrr_third21
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_third21
+Beta_matrix=datas_admm_third2$Beta_matrix
+datas_s2_1x=datas_admm_third2
+
+Beta1 <- r2$Alpha %*% r2$Gamma
+eta1=datas_s2_1x$X_list[[1]]%*%Beta1
+
+Beta2 <- r2_pen.survrrr$Alpha %*% r2_pen.survrrr$Gamma
+eta2=datas_s2_1x$X_list[[1]]%*%Beta2
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+eta3=datas_s2_1x$X_list[[1]]%*%Beta3
+
+breaks <- seq(min(eta1,eta2,eta3), max(eta1,eta2,eta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+eta_df1 <- reshape2::melt(eta1)
+eta_df2 <- reshape2::melt(eta2)
+eta_df3 <- reshape2::melt(eta3)
+
+eta_df1$Var2=eta_df2$Var2
+
+e1third21 <- ggplot(eta_df1, aes(x = Var2, y = Var1, fill = value)) +
+ geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Unpenalized survRRR', width = 20)) 
+
+
+e2third21  <- ggplot(eta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20)) 
+
+e3third21  <- ggplot(eta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20)) 
+
+```
+
+
+### Fit using rank 2
+
+```{r}
+set.seed(123)
+
+nranks_fit = 2
+Gamma.iter<-matrix(rnorm(nranks_fit*k),nranks_fit,k)
+
+start_timesthird221= Sys.time()  
+
+r2_third22 <- redrank(redrank=formula, data = dlong, R = nranks_fit,eps = 1e-5)
+
+end_timesthird221= Sys.time()  
+
+r2_pen.survrrr_thirdd22 <- pen.survrrr(redrank=formula, dat = dlong, R = nranks_fit,
+                              Gamma.iter = Gamma.iter, eps = 1e-5, thresh = 1e-7, maxit = 1e4, lambda.alpha = lambda1, lambda.gamma =  lambda1, standardize.opt = F,alpha = 1)
+
+end_timesthird222= Sys.time()  
+
+r2_pen.admm.survrrr_third22 <- pen.admm.survrrr(formula,  R = nranks_fit, Gamma.iter = Gamma.iter, dat = dlong,
+                                lambda.alpha = lambda1, lambda.gamma = lambda1, overall_eps = 1e-5, res_tol = 1e-7, maxit = 1e4, rho=1)
+
+end_timesthird223= Sys.time()  
+```
+
+
+#### Betas
+```{r}
+r2=r2_third22
+r2_pen.survrrr=r2_pen.survrrr_thirdd22
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_third22
+Beta_matrix=datas_admm_third2$Beta_matrix
+datas_s2_1x=datas_admm_third2
+
+Beta1 <- r2$Alpha %*% r2$Gamma
+estimated_coefficients1 <- Beta1
+true_coefficients1 <- Beta_matrix
+mse1<- (estimated_coefficients1 - true_coefficients1)^2
+mean(mse1)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta1 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta2 <- r2_pen.survrrr$Alpha  %*% r2_pen.survrrr$Gamma
+estimated_coefficients2 <- Beta2
+true_coefficients2 <- Beta_matrix
+mse2<- (estimated_coefficients2 - true_coefficients2)^2
+mean(mse2) 
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta2 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+estimated_coefficients3 <- Beta3
+true_coefficients3 <- Beta_matrix
+mse3<- (estimated_coefficients3 - true_coefficients3)^2
+mean(mse3)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta3 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+
+breaks <- seq(min(Beta1,Beta2,Beta3), max(Beta1,Beta2,Beta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+beta_df1 <- reshape2::melt(Beta1)
+beta_df2 <- reshape2::melt(Beta2)
+beta_df3 <- reshape2::melt(Beta3)
+
+beta_df1$Var2=beta_df2$Var2
+
+p1third22 <- ggplot(beta_df1, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+ ggtitle(str_wrap('Unpenalized survRRR', width = 20)) 
+
+
+p2third22 <- ggplot(beta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20)) 
+
+p3third22 <- ggplot(beta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20)) 
+
+```
+
+
+#### etas
+
+
+```{r}
+r2=r2_third22
+r2_pen.survrrr=r2_pen.survrrr_thirdd22
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_third22
+Beta_matrix=datas_admm_third2$Beta_matrix
+datas_s2_1x=datas_admm_third2
+
+Beta1 <- r2$Alpha %*% r2$Gamma
+eta1=datas_s2_1x$X_list[[1]]%*%Beta1
+
+Beta2 <- r2_pen.survrrr$Alpha %*% r2_pen.survrrr$Gamma
+eta2=datas_s2_1x$X_list[[1]]%*%Beta2
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+eta3=datas_s2_1x$X_list[[1]]%*%Beta3
+
+breaks <- seq(min(eta1,eta2,eta3), max(eta1,eta2,eta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+eta_df1 <- reshape2::melt(eta1)
+eta_df2 <- reshape2::melt(eta2)
+eta_df3 <- reshape2::melt(eta3)
+
+eta_df1$Var2=eta_df2$Var2
+
+e1third22 <- ggplot(eta_df1, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Unpenalized survRRR', width = 20)) 
+
+
+e2third22  <- ggplot(eta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+ ggtitle(str_wrap('Penalized survRRR with glmnet', width = 20)) 
+
+e3third22  <- ggplot(eta_df3, aes(x = Var2, y = Var1, fill = value)) +
+ geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20)) 
+
+```
+
+
+
+## PLOTS
+
+
+```{r}
+combined_plot <- (p1third11 + p2third11 + p3third11) / (p1third12 + p2third12 + p3third12) / (p1third21 + p2third21 + p3third21) / (p1third21 + p2third21 + p3third21)+
+  plot_annotation(
+    title = "Estimated B by each model for:\nn=500, p=5, K=4, case=1, cor=0.7, λ=0",
+    subtitle = c("First row: Data simulated with rank 1 and fitted with rank 1\nSecond row: Data simulated with rank 1 and fitted with rank 2\nThird row: Data simulated with rank 2 and fitted with rank 1\nFourth row: Data simulated with rank 2 and fitted with rank 2"),
+    theme = theme(
+      plot.title = element_text(size = 20, hjust = 0.5),
+      plot.subtitle = element_text(size = 14, hjust = 0)
+    )
+  )
+
+
+combined_plot2 <- (e1third11 + e2third11 + e3third11) / (e1third12 + e2third12 + e3third12) / (e1third21 + e2third21 + e3third21) / (e1third21 + e2third21 + e3third21)+
+  plot_annotation(
+    title = "Estimated η=ZB by each model for:\nn=500, p=5, K=4, case=1, cor=0.7, λ=0",
+    subtitle = c("First row: Data simulated with rank 1 and fitted with rank 1\nSecond row: Data simulated with rank 1 and fitted with rank 2\nThird row: Data simulated with rank 2 and fitted with rank 1\nFourth row: Data simulated with rank 2 and fitted with rank 2"),
+    theme = theme(
+      plot.title = element_text(size = 20, hjust = 0.5),
+      plot.subtitle = element_text(size = 14, hjust = 0)
+    )
+  )
+
+ggsave("admm_third_b.png", combined_plot, width = 6, height = 7)
+ggsave("admm_third_e.png", combined_plot2, width = 6, height = 7)
+```
+
+
+
+# FOURTH Configuration (sample size:500, p=5,k=4, case=1, cor=0.7, lambda1= 1e-4, n_simulation=1
+
+## Call functions to simulate 1 dataset using rank 1
+
+```{r}
+#set seed
+set.seed(123)
+#chose variables
+n = 500   # Number of observations
+p <- 5  # Number of covariates
+k <- 4  # Number of outcomes
+n_simulations = 1
+
+r <- 1  # Rank of simulated data
+
+
+datas_admm_fourth1 = simulations_data(n,p,r,k,n_simulations,case = 1,corr = 0.7)
+
+rank_check(datas_admm_fourth1$Beta_matrix)
+
+
+dlong <- datas_admm_fourth1$dlong_list[[1]]
+dlong=dlong[dlong$Tstop > dlong$Tstart, ]
+
+#construct formula for the model
+predictor_names <- grep("^x", names(dlong), value = TRUE)
+formula_str <- paste("Surv(Tstop, status) ~", paste(predictor_names, collapse = " + "))
+formula <- as.formula(formula_str)
+redrank = formula
+
+lambda1= 1e-4
+```
+
+
+### Fit using rank 1
+
+```{r}
+set.seed(123)
+
+nranks_fit = 1
+Gamma.iter<-matrix(rnorm(nranks_fit*k),nranks_fit,k)
+
+end_timesfourth111= Sys.time()  
+
+r2_pen.survrrr_fourth11 <- pen.survrrr(redrank=formula, dat = dlong, R = nranks_fit,
+                              Gamma.iter = Gamma.iter, eps = 1e-5, thresh = 1e-7, maxit = 1e4, lambda.alpha = lambda1, lambda.gamma =  lambda1, standardize.opt = F,alpha = 1)
+
+end_timesfourth112= Sys.time()  
+
+r2_pen.admm.survrrr_fourth11 <- pen.admm.survrrr(formula,  R = nranks_fit, Gamma.iter = Gamma.iter, dat = dlong,
+                                lambda.alpha = lambda1, lambda.gamma = lambda1, overall_eps = 1e-5, res_tol = 1e-7, maxit = 1e4, rho=1)
+
+end_timesfourth113= Sys.time()  
+```
+
+#### Betas
+```{r}
+r2_pen.survrrr=r2_pen.survrrr_fourth11
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_fourth11
+Beta_matrix=datas_admm_fourth1$Beta_matrix
+datas_s2_1x=datas_admm_fourth1
+
+Beta2 <- r2_pen.survrrr$Alpha  %*% r2_pen.survrrr$Gamma
+estimated_coefficients2 <- Beta2
+true_coefficients2 <- Beta_matrix
+mse2<- (estimated_coefficients2 - true_coefficients2)^2
+mean(mse2) 
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta2 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+estimated_coefficients3 <- Beta3
+true_coefficients3 <- Beta_matrix
+mse3<- (estimated_coefficients3 - true_coefficients3)^2
+mean(mse3)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta3 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+
+breaks <- seq(min(Beta2,Beta3), max(Beta2,Beta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+beta_df2 <- reshape2::melt(Beta2)
+beta_df3 <- reshape2::melt(Beta3)
+
+
+
+p2fourth11 <- ggplot(beta_df2, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmmnet', width = 20))
+
+p3fourth11  <- ggplot(beta_df3, aes(x = Var2, y = Var1, fill = value)) +
+   geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+```
+
+
+#### etas
+
+
+```{r}
+r2_pen.survrrr=r2_pen.survrrr_fourth11
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_fourth11
+Beta_matrix=datas_admm_fourth1$Beta_matrix
+datas_s2_1x=datas_admm_fourth1
+
+
+Beta2 <- r2_pen.survrrr$Alpha %*% r2_pen.survrrr$Gamma
+eta2=datas_s2_1x$X_list[[1]]%*%Beta2
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+eta3=datas_s2_1x$X_list[[1]]%*%Beta3
+
+breaks <- seq(min(eta2,eta3), max(eta2,eta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+eta_df2 <- reshape2::melt(eta2)
+eta_df3 <- reshape2::melt(eta3)
+
+
+
+e2fourth11  <- ggplot(eta_df2, aes(x = Var2, y = Var1, fill = value)) +
+   geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmmnet', width = 20))
+
+e3fourth11  <- ggplot(eta_df3, aes(x = Var2, y = Var1, fill = value)) +
+   geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+```
+
+
+### Fit using rank 2
+
+```{r}
+set.seed(123)
+
+nranks_fit = 2
+Gamma.iter<-matrix(rnorm(nranks_fit*k),nranks_fit,k)
+
+
+end_timesfourth121= Sys.time()  
+
+r2_pen.survrrr_fourth12 <- pen.survrrr(redrank=formula, dat = dlong, R = nranks_fit,
+                              Gamma.iter = Gamma.iter, eps = 1e-5, thresh = 1e-7, maxit = 1e4, lambda.alpha = lambda1, lambda.gamma =  lambda1, standardize.opt = F,alpha = 1)
+
+end_timesfourth122= Sys.time()  
+
+r2_pen.admm.survrrr_fourth12 <- pen.admm.survrrr(formula,  R = nranks_fit, Gamma.iter = Gamma.iter, dat = dlong,
+                                lambda.alpha = lambda1, lambda.gamma = lambda1, overall_eps = 1e-5, res_tol = 1e-7, maxit = 1e4, rho=1)
+
+end_timesfourth123= Sys.time()  
+```
+
+
+#### Betas
+```{r}
+r2_pen.survrrr=r2_pen.survrrr_fourth12
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_fourth12
+Beta_matrix=datas_admm_fourth1$Beta_matrix
+datas_s2_1x=datas_admm_fourth1
+
+Beta2 <- r2_pen.survrrr$Alpha  %*% r2_pen.survrrr$Gamma
+estimated_coefficients2 <- Beta2
+true_coefficients2 <- Beta_matrix
+mse2<- (estimated_coefficients2 - true_coefficients2)^2
+mean(mse2) 
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta2 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+estimated_coefficients3 <- Beta3
+true_coefficients3 <- Beta_matrix
+mse3<- (estimated_coefficients3 - true_coefficients3)^2
+mean(mse3)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta3 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+
+breaks <- seq(min(Beta2,Beta3), max(Beta2,Beta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+beta_df2 <- reshape2::melt(Beta2)
+beta_df3 <- reshape2::melt(Beta3)
+
+
+
+p2fourth12 <- ggplot(beta_df2, aes(x = Var2, y = Var1, fill = value)) +
+   geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmmnet', width = 20))
+
+p3fourth12  <- ggplot(beta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+```
+
+
+#### etas
+
+
+```{r}
+r2_pen.survrrr=r2_pen.survrrr_fourth12
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_fourth12
+Beta_matrix=datas_admm_fourth1$Beta_matrix
+datas_s2_1x=datas_admm_fourth1
+
+
+Beta2 <- r2_pen.survrrr$Alpha %*% r2_pen.survrrr$Gamma
+eta2=datas_s2_1x$X_list[[1]]%*%Beta2
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+eta3=datas_s2_1x$X_list[[1]]%*%Beta3
+
+breaks <- seq(min(eta2,eta3), max(eta2,eta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+eta_df2 <- reshape2::melt(eta2)
+eta_df3 <- reshape2::melt(eta3)
+
+
+
+e2fourth12  <- ggplot(eta_df2, aes(x = Var2, y = Var1, fill = value)) +
+   geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmmnet', width = 20))
+
+e3fourth12  <- ggplot(eta_df3, aes(x = Var2, y = Var1, fill = value)) +
+   geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+```
+
+
+
+## Call functions to simulate 1 dataset using rank 2
+
+```{r}
+#set seed
+set.seed(123)
+#chose variables
+n = 500   # Number of observations
+p <- 5  # Number of covariates
+k <- 4  # Number of outcomes
+n_simulations = 1
+
+r <- 2  # Rank of simulated data
+
+
+datas_admm_fourth2 = simulations_data(n,p,r,k,n_simulations,case = 1,corr = 0.7)
+
+rank_check(datas_admm_fourth2$Beta_matrix)
+
+
+dlong <- datas_admm_fourth2$dlong_list[[1]]
+dlong=dlong[dlong$Tstop > dlong$Tstart, ]
+
+#construct formula for the model
+predictor_names <- grep("^x", names(dlong), value = TRUE)
+formula_str <- paste("Surv(Tstop, status) ~", paste(predictor_names, collapse = " + "))
+formula <- as.formula(formula_str)
+redrank = formula
+
+lambda1=1e-4
+```
+
+
+
+### Fit using rank 1
+
+```{r}
+set.seed(123)
+
+nranks_fit = 1
+Gamma.iter<-matrix(rnorm(nranks_fit*k),nranks_fit,k)
+
+
+end_timesfourth211= Sys.time()  
+
+r2_pen.survrrr_fourth21 <- pen.survrrr(redrank=formula, dat = dlong, R = nranks_fit,
+                              Gamma.iter = Gamma.iter, eps = 1e-5, thresh = 1e-7, maxit = 1e4, lambda.alpha = lambda1, lambda.gamma =  lambda1, standardize.opt = F,alpha = 1)
+
+end_timesfourth212= Sys.time()  
+
+r2_pen.admm.survrrr_fourth21 <- pen.admm.survrrr(formula,  R = nranks_fit, Gamma.iter = Gamma.iter, dat = dlong,
+                                lambda.alpha = lambda1, lambda.gamma = lambda1, overall_eps = 1e-5, res_tol = 1e-7, maxit = 1e4, rho=1)
+
+end_timesfourth213= Sys.time()  
+```
+
+
+#### Betas
+```{r}
+r2_pen.survrrr=r2_pen.survrrr_fourth21
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_fourth21
+Beta_matrix=datas_admm_fourth2$Beta_matrix
+datas_s2_1x=datas_admm_fourth2
+
+Beta2 <- r2_pen.survrrr$Alpha  %*% r2_pen.survrrr$Gamma
+estimated_coefficients2 <- Beta2
+true_coefficients2 <- Beta_matrix
+mse2<- (estimated_coefficients2 - true_coefficients2)^2
+mean(mse2) 
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta2 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+estimated_coefficients3 <- Beta3
+true_coefficients3 <- Beta_matrix
+mse3<- (estimated_coefficients3 - true_coefficients3)^2
+mean(mse3)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta3 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+
+breaks <- seq(min(Beta2,Beta3), max(Beta2,Beta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+beta_df2 <- reshape2::melt(Beta2)
+beta_df3 <- reshape2::melt(Beta3)
+
+
+
+p2fourth21 <- ggplot(beta_df2, aes(x = Var2, y = Var1, fill = value)) +
+   geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmmnet', width = 20))
+
+p3fourth21  <- ggplot(beta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+```
+
+
+#### etas
+
+
+```{r}
+r2_pen.survrrr=r2_pen.survrrr_fourth21
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_fourth21
+Beta_matrix=datas_admm_fourth2$Beta_matrix
+datas_s2_1x=datas_admm_fourth2
+
+
+Beta2 <- r2_pen.survrrr$Alpha %*% r2_pen.survrrr$Gamma
+eta2=datas_s2_1x$X_list[[1]]%*%Beta2
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+eta3=datas_s2_1x$X_list[[1]]%*%Beta3
+
+breaks <- seq(min(eta2,eta3), max(eta2,eta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+eta_df2 <- reshape2::melt(eta2)
+eta_df3 <- reshape2::melt(eta3)
+
+
+
+e2fourth21  <- ggplot(eta_df2, aes(x = Var2, y = Var1, fill = value)) +
+   geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmmnet', width = 20))
+
+e3fourth21  <- ggplot(eta_df3, aes(x = Var2, y = Var1, fill = value)) +
+   geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+```
+
+
+### Fit using rank 2
+
+```{r}
+set.seed(123)
+
+nranks_fit = 2
+Gamma.iter<-matrix(rnorm(nranks_fit*k),nranks_fit,k)
+
+
+end_timesfourth221= Sys.time() 
+
+r2_pen.survrrr_fourth22 <- pen.survrrr(redrank=formula, dat = dlong, R = nranks_fit,
+                              Gamma.iter = Gamma.iter, eps = 1e-5, thresh = 1e-7, maxit = 1e4, lambda.alpha = lambda1, lambda.gamma =  lambda1, standardize.opt = F,alpha = 1)
+
+end_timesfourth222= Sys.time() 
+
+r2_pen.admm.survrrr_fourth22 <- pen.admm.survrrr(formula,  R = nranks_fit, Gamma.iter = Gamma.iter, dat = dlong,
+                                lambda.alpha = lambda1, lambda.gamma = lambda1, overall_eps = 1e-5, res_tol = 1e-7, maxit = 1e4, rho=1)
+
+end_timesfourth223= Sys.time() 
+```
+
+
+#### Betas
+```{r}
+r2_pen.survrrr=r2_pen.survrrr_fourth22
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_fourth22
+Beta_matrix=datas_admm_fourth2$Beta_matrix
+datas_s2_1x=datas_admm_fourth2
+
+Beta2 <- r2_pen.survrrr$Alpha  %*% r2_pen.survrrr$Gamma
+estimated_coefficients2 <- Beta2
+true_coefficients2 <- Beta_matrix
+mse2<- (estimated_coefficients2 - true_coefficients2)^2
+mean(mse2) 
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta2 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+estimated_coefficients3 <- Beta3
+true_coefficients3 <- Beta_matrix
+mse3<- (estimated_coefficients3 - true_coefficients3)^2
+mean(mse3)
+mean(rowSums((datas_s2_1x$X_list[[1]]%*%Beta3 - datas_s2_1x$X_list[[1]]%*%Beta_matrix)^2)/k)
+
+
+breaks <- seq(min(Beta2,Beta3), max(Beta2,Beta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+beta_df2 <- reshape2::melt(Beta2)
+beta_df3 <- reshape2::melt(Beta3)
+
+
+
+p2fourth22 <- ggplot(beta_df2, aes(x = Var2, y = Var1, fill = value)) +
+   geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmmnet', width = 20))
+
+p3fourth22  <- ggplot(beta_df3, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+
+```
+
+
+#### etas
+
+
+```{r}
+r2_pen.survrrr=r2_pen.survrrr_fourth22
+r2_pen.admm.survrrr=r2_pen.admm.survrrr_fourth22
+Beta_matrix=datas_admm_fourth2$Beta_matrix
+datas_s2_1x=datas_admm_fourth2
+
+
+Beta2 <- r2_pen.survrrr$Alpha %*% r2_pen.survrrr$Gamma
+eta2=datas_s2_1x$X_list[[1]]%*%Beta2
+
+Beta3 <- r2_pen.admm.survrrr$Alpha %*% r2_pen.admm.survrrr$Gamma
+eta3=datas_s2_1x$X_list[[1]]%*%Beta3
+
+breaks <- seq(min(eta2,eta3), max(eta2,eta3), length.out = 101) 
+norm_breaks <- (breaks - min(breaks)) / (max(breaks) - min(breaks))
+my_palette <- colorRampPalette(c("lightgrey", "orange", "black"))(100)
+
+eta_df2 <- reshape2::melt(eta2)
+eta_df3 <- reshape2::melt(eta3)
+
+
+
+e2fourth22  <- ggplot(eta_df2, aes(x = Var2, y = Var1, fill = value)) +
+   geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with glmmnet', width = 20))
+
+e3fourth22  <- ggplot(eta_df3, aes(x = Var2, y = Var1, fill = value)) +
+   geom_tile() +
+  scale_fill_gradientn(colors = my_palette, 
+                       values = norm_breaks,
+                       limits = range(breaks), 
+                       guide = guide_colorbar(barwidth = 0.3, barheight = 3)) + 
+  theme_minimal() +
+  labs(x = "", y = "", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(size = 11),
+    legend.title = element_text(size = 8, margin = margin(t = 5, b = 5)),  # Adjust title size and spacing
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),           
+    plot.margin = margin(0, 0, 0, 0),             
+    legend.position.insidein = margin(0, 0, 0, -10),      
+    legend.spacing.x = unit(0, "cm"))+
+  ggtitle(str_wrap('Penalized survRRR with ADMM', width = 20))
+```
+
+
+
+## PLOTS
+
+
+```{r}
+
+combined_plot <- ( p2fourth11 + p3fourth11) / (p2fourth12 + p3fourth12) / ( p2fourth21 + p3fourth21) / (p2fourth21 + p3fourth21)+
+
+  plot_annotation(
+    title = "Estimated B by each model for:\nn=500, p=5, K=4, case=1, cor=0.7, λ=0.0001",
+    subtitle = c("First row: Data simulated with rank 1 and fitted with rank 1\nSecond row: Data simulated with rank 1 and fitted with rank 2\nThird row: Data simulated with rank 2 and fitted with rank 1\nFourth row: Data simulated with rank 2 and fitted with rank 2"),
+    theme = theme(
+      plot.title = element_text(size = 20, hjust = 0.5),
+      plot.subtitle = element_text(size = 14, hjust = 0)
+    )
+  )
+
+
+combined_plot2 <- (e2fourth11 + e3fourth11) / (e2fourth12 + e3fourth12) / ( e2fourth21 + e3fourth21) / ( e2fourth21 + e3fourth21)+
+
+  plot_annotation(
+    title = "Estimated η=ZB by each model for:\nn=500, p=5, K=4, case=1, cor=0.7, λ=0.0001",
+    subtitle = c("First row: Data simulated with rank 1 and fitted with rank 1\nSecond row: Data simulated with rank 1 and fitted with rank 2\nThird row: Data simulated with rank 2 and fitted with rank 1\nFourth row: Data simulated with rank 2 and fitted with rank 2"),
+    theme = theme(
+      plot.title = element_text(size = 20, hjust = 0.5),
+      plot.subtitle = element_text(size = 14, hjust = 0)
+    )
+  )
+
+ggsave("admm_fourth_b.png", combined_plot, width = 6, height = 7)
+ggsave("admm_fourth_e.png", combined_plot2, width = 6, height = 7)
+```
+
