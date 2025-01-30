@@ -5,10 +5,7 @@ output:
   html_document: default
 date: "2024-06-03"
 ---
-```{r}
-#Note from meeting: #train-test set
-#we generate rank 3 and a few predictors and an outcome are very correlated, but the other coefficients are very low correlated. We apply lasso with different ranks and see which one fit best. 
-```
+
 
 
 
