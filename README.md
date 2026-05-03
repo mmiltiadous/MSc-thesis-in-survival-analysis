@@ -1,5 +1,6 @@
 # General
-This repository contains the code used for my thesis for MSc in Statistics and Data Science. The title of the thesis is the following: Penalized reduced rank regression for multidimensional survival data: new estimation approaches and simulation study. Report can be found through this link: https://studenttheses.universiteitleiden.nl/access/item%3A4198338/view
+This repository contains the code for my MSc thesis in Statistics and Data Science.
+The thesis, titled “Penalized reduced rank regression for multidimensional survival data: new estimation approaches and simulation study”, is available at the following link: https://studenttheses.universiteitleiden.nl/access/item%3A4198338/view
 # Folders information
 There are 3 folders:
 ## SimultionStudy1
